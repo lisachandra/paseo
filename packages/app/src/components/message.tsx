@@ -3170,14 +3170,22 @@ export const ToolCall = memo(function ToolCall({
     maxDetailHeight,
   ]);
 
-  if (presentation.isPlan && effectiveDetail?.type === "plan") {
-    return (
-      <PlanCard
-        text={effectiveDetail.text}
-        testID="timeline-plan-card"
-        disableOuterSpacing={disableOuterSpacing}
-      />
-    );
+  if (presentation.isPlan) {
+    const planText =
+      effectiveDetail?.type === "plan"
+        ? effectiveDetail.text
+        : effectiveDetail?.type === "plain_text"
+          ? (effectiveDetail as { text?: string }).text ?? ""
+          : "";
+    if (planText) {
+      return (
+        <PlanCard
+          text={planText}
+          testID="timeline-plan-card"
+          disableOuterSpacing={disableOuterSpacing}
+        />
+      );
+    }
   }
 
   return (

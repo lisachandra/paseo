@@ -74,6 +74,6 @@ export function buildToolCallPresentation(
     hasDetails,
     canOpenDetails: hasDetails || isLoadingDetails,
     openFilePath: extractToolCallFilePath(input.detail),
-    isPlan: input.detail?.type === "plan",
+    isPlan: input.detail?.type === "plan" || (input.detail?.type === "plain_text" && (input.detail as { label?: string })?.label === "Proposed Plan"),
   };
 }

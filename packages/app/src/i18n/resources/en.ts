@@ -632,6 +632,8 @@ export const en = {
         archiveRunningAgentTitle: "Archive running agent?",
         archiveRunningAgentMessage:
           "This agent is still running. Archiving it will stop the agent and close the tab.",
+        archiveAgentTitle: 'Archive "{{title}}"?',
+        archiveAgentMessage: 'Close "{{title}}"? The session will move to History and can be restored.',
         closeTabsLeftTitle: "Close tabs to the left?",
         closeTabsRightTitle: "Close tabs to the right?",
         closeOtherTabsTitle: "Close other tabs?",

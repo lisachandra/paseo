@@ -2,9 +2,10 @@
 android_sdk_version = '{{ read_file(path=".tool-versions") | split(pat="android-sdk") | last | trim | split(pat="\n") | first | trim }}'
 
 [env]
-ANDROID_HOME = "{{ env.HOME }}/.local/share/mise/installs/android-sdk/{{ vars.android_sdk_version }}"
+# Windows Git Bash has no HOME (USERPROFILE instead), so fall back off HOME.
+ANDROID_HOME = "{{ env.HOME | default(value=env.USERPROFILE) | default(value=".") }}/.local/share/mise/installs/android-sdk/{{ vars.android_sdk_version }}"
 _.path = [
-  "{{ env.HOME }}/.local/share/mise/installs/android-sdk/{{ vars.android_sdk_version }}/cmdline-tools/{{ vars.android_sdk_version }}/bin",
-  "{{ env.HOME }}/.local/share/mise/installs/android-sdk/{{ vars.android_sdk_version }}/platform-tools",
-  "{{ env.HOME }}/.local/share/mise/installs/android-sdk/{{ vars.android_sdk_version }}/emulator",
+  "{{ env.HOME | default(value=env.USERPROFILE) | default(value=".") }}/.local/share/mise/installs/android-sdk/{{ vars.android_sdk_version }}/cmdline-tools/{{ vars.android_sdk_version }}/bin",
+  "{{ env.HOME | default(value=env.USERPROFILE) | default(value=".") }}/.local/share/mise/installs/android-sdk/{{ vars.android_sdk_version }}/platform-tools",
+  "{{ env.HOME | default(value=env.USERPROFILE) | default(value=".") }}/.local/share/mise/installs/android-sdk/{{ vars.android_sdk_version }}/emulator",
 ]

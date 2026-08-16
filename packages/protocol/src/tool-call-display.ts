@@ -113,6 +113,12 @@ function buildCanonicalDetailDisplay(input: ToolCallDisplayInput): DetailDisplay
         summary: readString(input.detail.description),
       };
     case "plain_text":
+      if (input.detail.label === "Proposed Plan") {
+        return {
+          displayName: "Plan",
+          summary: input.detail.label,
+        };
+      }
       return {
         summary: input.detail.label,
       };

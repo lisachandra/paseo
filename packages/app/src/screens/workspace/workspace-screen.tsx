@@ -1346,7 +1346,7 @@ function renderWorkspaceContent(input: RenderWorkspaceContentInput): React.React
     return (
       <View style={styles.emptyState}>
         <Text style={styles.emptyStateText}>
-          No tabs are available yet. Use New tab to create an agent or terminal.
+          No tabs are available yet. Use New tab to create an agent or terminal. Check History (clock icon) for archived sessions — they can be restored.
         </Text>
       </View>
     );
@@ -2662,11 +2662,16 @@ function WorkspaceScreenContent({
           useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
         let closePolicy = resolveCloseAgentTabPolicy(agent);
         const isRunning = agent?.status === "running";
+        const title = (agent as any)?.title ?? agentId.slice(0, 8);
 
-        if (isRunning && closePolicy.kind === "archive-on-close") {
+        if (closePolicy.kind === "archive-on-close") {
           const confirmed = await confirmDialog({
-            title: t("workspace.tabs.confirmations.archiveRunningAgentTitle"),
-            message: t("workspace.tabs.confirmations.archiveRunningAgentMessage"),
+            title: isRunning
+              ? t("workspace.tabs.confirmations.archiveRunningAgentTitle")
+              : t("workspace.tabs.confirmations.archiveAgentTitle", { title }),
+            message: isRunning
+              ? t("workspace.tabs.confirmations.archiveRunningAgentMessage")
+              : t("workspace.tabs.confirmations.archiveAgentMessage", { title }),
             confirmLabel: t("workspace.tabs.confirmations.archive"),
             cancelLabel: t("workspace.tabs.confirmations.cancel"),
             destructive: true,

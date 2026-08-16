@@ -2843,7 +2843,22 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   private handleUsageUpdate(update: UsageUpdate): void {
-    void update;
+    const used = update.used;
+    const size = update.size;
+    const amount = update.cost?.amount ?? undefined;
+    const current = this.currentTurnUsage ?? {};
+    this.currentTurnUsage = {
+      ...current,
+      contextWindowUsedTokens: used,
+      contextWindowMaxTokens: size,
+      ...(amount !== undefined ? { totalCostUsd: amount } : {}),
+    };
+    this.pushEvent({
+      type: "usage_updated",
+      provider: this.provider,
+      usage: this.currentTurnUsage,
+      ...(this.activeForegroundTurnId ? { turnId: this.activeForegroundTurnId } : {}),
+    });
   }
 
   private handlePromptResponse(response: PromptResponse, turnId: string): void {
@@ -3337,6 +3352,12 @@ function mapToolDetail(
     rawOutput: readRecord(snapshot.rawOutput),
   };
 
+  // Dirac plan proposal arrives as generic tool snapshot with title "Proposed Plan"
+  // (plain_text). Promote to native plan detail so Paseo renders it as markdown body,
+  // not a collapsed tool checkbox.
+  if (snapshot.title === "Proposed Plan" && context.textContent) {
+    return { type: "plan", text: context.textContent };
+  }
   switch (snapshot.kind) {
     case "read":
       return buildReadToolDetail(context);
@@ -3368,11 +3389,28 @@ function mapToolDetail(
   }
 }
 
+
+function extractPathFromSnapshotTitle(title: string | undefined): string | undefined {
+  if (!title) return undefined;
+  // Titles like 'Reading from X', 'Read from X', 'Listed files in X', 'Read image from X' -> extract X
+  const fromIdx = title.indexOf(" from ");
+  if (fromIdx !== -1) return title.slice(fromIdx + 6).trim().replace(/\s*\(.*\)$/, "").replace(/\s*\(no changes\)$/, "") || undefined;
+  const inIdx = title.indexOf(" in ");
+  if (inIdx !== -1) return title.slice(inIdx + 4).trim() || undefined;
+  // fallback: if title looks like a path (contains / or \ ), use it directly
+  if (title.includes("/") || title.includes("\\")) return title;
+  return undefined;
+}
+
 function buildReadToolDetail(context: MapToolDetailContext): ToolCallDetail {
   const { snapshot, firstLocation, textContent, rawInput, rawOutput } = context;
+  const titlePath = extractPathFromSnapshotTitle(snapshot.title);
+  // Dirac can reuse a toolCallId across sequential reads (Paseo collapses by callId),
+  // so rawInput/firstLocation can be stale. Prefer the human-visible title path when present.
+  const detailFilePath = titlePath ?? firstLocation ?? readString(rawInput, ["path", "filePath", "file"]) ?? "";
   return {
     type: "read",
-    filePath: firstLocation ?? readString(rawInput, ["path", "filePath", "file"]) ?? snapshot.title,
+    filePath: detailFilePath,
     content: textContent ?? readString(rawOutput, ["content", "text"]),
     offset: readNumber(rawInput, ["offset", "line"]),
     limit: readNumber(rawInput, ["limit"]),

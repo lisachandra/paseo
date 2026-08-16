@@ -150,10 +150,10 @@ const CATALOG_DATA = [
     title: "Dirac",
     description:
       "Reduces API costs by more than 50%, produces better and faster work. Uses Hash anchored parallel edits, AST manipulation and a whole lot of neat optimizations. Fully Open Source.",
-    version: "0.4.22",
+    version: "0.4.35",
     iconId: "dirac",
     installLink: "https://dirac.run",
-    command: ["npx", "-y", "dirac-cli@0.4.22", "--acp"],
+    command: ["dirac", "--acp"],
   },
   {
     id: "factory-droid",

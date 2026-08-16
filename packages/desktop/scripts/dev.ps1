@@ -7,7 +7,7 @@ $RootDir = (Resolve-Path "$DesktopDir\..\..").Path
 $env:PATH = "$RootDir\node_modules\.bin;$env:PATH"
 
 # Build the Electron main process
-npm run build:main
+npm --prefix "$DesktopDir" run build:main
 
 # Prefer Metro's stable default port so dev browser storage keeps the same
 # localhost origin across restarts. Fall back only when earlier ports are busy.

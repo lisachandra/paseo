@@ -3376,12 +3376,24 @@ export class AgentManager {
   ): Promise<void> {
     try {
       const newInfo = await agent.session.getRuntimeInfo();
+      const titleChanged = (newInfo.extra?.title as string | undefined) !== (agent.runtimeInfo?.extra?.title as string | undefined);
       const changed =
         newInfo.model !== agent.runtimeInfo?.model ||
         newInfo.thinkingOptionId !== agent.runtimeInfo?.thinkingOptionId ||
         newInfo.sessionId !== agent.runtimeInfo?.sessionId ||
-        newInfo.modeId !== agent.runtimeInfo?.modeId;
+        newInfo.modeId !== agent.runtimeInfo?.modeId ||
+        titleChanged;
       agent.runtimeInfo = newInfo;
+      if (titleChanged && typeof newInfo.extra?.title === "string" && newInfo.extra.title.trim()) {
+        const normalizedTitle = newInfo.extra.title.trim();
+        const maybeLive = this.agents.get(agent.id) as ActiveManagedAgent | undefined;
+        if (maybeLive) {
+          (maybeLive as unknown as Record<string, unknown>).title = normalizedTitle;
+        } else {
+          (agent as unknown as Record<string, unknown>).title = normalizedTitle;
+        }
+        await this.persistSnapshot(agent as unknown as ManagedAgent, { title: normalizedTitle });
+      }
       if (!agent.persistence && newInfo.sessionId) {
         agent.persistence = attachPersistenceCwd(
           { provider: agent.provider, sessionId: newInfo.sessionId },
