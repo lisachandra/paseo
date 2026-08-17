@@ -1926,27 +1926,33 @@ export class ACPAgentSession implements AgentSession, ACPClient {
             ?.map((model) => model.modelId)
             .join(", ")}`,
         );
-        return;
-      }
+        // Fall through to config option path — additionalModels may be
+        // merged into the catalog but not yet reflected in this session's
+        // live configOptions (Dirac openai-type agents advertise only one
+        // entry). Let the provider decide.
+        if (!selection.configOption) {
+          return;
+        }
+      } else {
+        if (typeof this.connection.unstable_setSessionModel !== "function") {
+          throw new Error(this.modelSelectionUnavailableMessage());
+        }
 
-      if (typeof this.connection.unstable_setSessionModel !== "function") {
-        throw new Error(this.modelSelectionUnavailableMessage());
-      }
-
-      try {
-        await this.connection.unstable_setSessionModel({
-          sessionId: this.sessionId,
-          modelId,
-        });
-        this.currentModel = modelId;
-        this.pushEvent({
-          type: "model_changed",
-          provider: this.provider,
-          runtimeInfo: this.runtimeInfo(),
-        });
-        return;
-      } catch {
-        // Fall through to config option path.
+        try {
+          await this.connection.unstable_setSessionModel({
+            sessionId: this.sessionId,
+            modelId,
+          });
+          this.currentModel = modelId;
+          this.pushEvent({
+            type: "model_changed",
+            provider: this.provider,
+            runtimeInfo: this.runtimeInfo(),
+          });
+          return;
+        } catch {
+          // Fall through to config option path.
+        }
       }
     }
 
@@ -1963,7 +1969,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
           .map((option) => option.value)
           .join(", ")}`,
       );
-      return;
+      // Fall through — additive additionalModels are valid even if the
+      // live ACP session hasn't advertised them yet (Dirac openai-type
+      // agents expose only currentModelId). Let the provider validate.
     }
 
     const response = await this.connection.setSessionConfigOption({
