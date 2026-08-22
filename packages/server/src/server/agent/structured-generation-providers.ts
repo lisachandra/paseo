@@ -27,10 +27,6 @@ export const DEFAULT_STRUCTURED_GENERATION_PROVIDERS: readonly StructuredGenerat
     { modelSubstring: "gpt-5.4-mini", thinkingOptionId: "low" },
     { modelSubstring: "minimax-m3" },
     { modelSubstring: "nemotron-3-super" },
-    // Dirac's current default model on this install; needed so workspaces still
-    // get LLM branch/title generation when only `dirac` (not haiku etc) is enabled.
-    { modelSubstring: "muse-spark" },
-    { modelSubstring: "by/muse-spark" },
   ] as const;
 
 export interface ResolveStructuredGenerationProvidersOptions {
