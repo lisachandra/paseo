@@ -3413,9 +3413,9 @@ function extractPathFromSnapshotTitle(title: string | undefined): string | undef
 function buildReadToolDetail(context: MapToolDetailContext): ToolCallDetail {
   const { snapshot, firstLocation, textContent, rawInput, rawOutput } = context;
   const titlePath = extractPathFromSnapshotTitle(snapshot.title);
-  // Dirac can reuse a toolCallId across sequential reads (Paseo collapses by callId),
-  // so rawInput/firstLocation can be stale. Prefer the human-visible title path when present.
-  const detailFilePath = titlePath ?? firstLocation ?? readString(rawInput, ["path", "filePath", "file"]) ?? "";
+  // Explicit per-call locations/rawInput are authoritative; fall back to the
+  // human-visible title only when neither is present.
+  const detailFilePath = firstLocation ?? readString(rawInput, ["path", "filePath", "file"]) ?? titlePath ?? "";
   return {
     type: "read",
     filePath: detailFilePath,
