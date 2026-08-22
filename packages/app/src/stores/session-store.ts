@@ -118,6 +118,7 @@ export interface WorkspaceDescriptor {
   name: string;
   title?: string | null;
   pinnedAt?: string | null;
+  labels?: string[];
   status: WorkspaceDescriptorPayload["status"];
   statusEnteredAt: Date | null;
   archivingAt: string | null;
@@ -154,6 +155,8 @@ export function normalizeWorkspaceDescriptor(
     name: payload.name,
     title: payload.title ?? null,
     pinnedAt: payload.pinnedAt ?? null,
+    // COMPAT(workspaceLabels): old daemons omit assignments.
+    labels: payload.labels ?? [],
     status: payload.status,
     statusEnteredAt,
     archivingAt: payload.archivingAt ?? null,
@@ -308,6 +311,8 @@ export interface AgentTimelineCursorState {
 export interface SessionReplicaTimeline {
   agentId: string;
   items: StreamItem[];
+  range: AgentTimelineCursorState | null;
+  hasOlder: boolean;
 }
 
 export interface SessionReplica {
@@ -789,6 +794,16 @@ export const useSessionStore = create<SessionStore>()(
             const tasks = latestTasksFromStream(timeline.items);
             if (tasks.length > 0) agentTasks.set(timeline.agentId, tasks);
           }
+          const agentTimelineCursor = new Map<string, AgentTimelineCursorState>();
+          const agentTimelineHasOlder = new Map<string, boolean>();
+          const agentTimelineHasNewer = new Map<string, boolean>();
+          const agentAuthoritativeHistoryApplied = new Map<string, boolean>();
+          if (timeline?.range) {
+            agentTimelineCursor.set(timeline.agentId, timeline.range);
+            agentTimelineHasOlder.set(timeline.agentId, timeline.hasOlder);
+            agentTimelineHasNewer.set(timeline.agentId, false);
+            agentAuthoritativeHistoryApplied.set(timeline.agentId, true);
+          }
           const agentLastActivity = new Map(prev.agentLastActivity);
           for (const agent of replica.agents.values()) {
             agentLastActivity.set(agent.id, agent.lastActivityAt);
@@ -806,6 +821,10 @@ export const useSessionStore = create<SessionStore>()(
                 hasWorkspaceDirectorySnapshot: true,
                 agentStreamTail,
                 agentTasks,
+                agentTimelineCursor,
+                agentTimelineHasOlder,
+                agentTimelineHasNewer,
+                agentAuthoritativeHistoryApplied,
               },
             },
             agentLastActivity,
