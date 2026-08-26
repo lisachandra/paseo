@@ -23,6 +23,7 @@ import {
   type ContentBlock,
   type CreateTerminalRequest,
   type CurrentModeUpdate,
+  type ElicitationSchema,
   type EnvVariable,
   type InitializeResponse,
   type KillTerminalRequest,
@@ -57,6 +58,15 @@ import {
   type WriteTextFileRequest,
   type Stream as ACPStream,
 } from "@agentclientprotocol/sdk";
+
+// Flat elicitation response matching the agent wire format (Dirac SDK 1.3.0).
+// paseo's pinned SDK 0.17.1 declares an outdated nested `ElicitationResponse`
+// (`{ action: { action: ... } }`) that conflicts with what agents send/expect,
+// so we model the real protocol shape locally.
+type ElicitationResponse =
+  | { action: "accept"; content?: Record<string, unknown> }
+  | { action: "decline" }
+  | { action: "cancel" };
 import type { Logger } from "pino";
 
 import {
@@ -249,6 +259,10 @@ const BASE_ACP_CLIENT_CAPABILITIES: ACPClientCapabilities = {
     writeTextFile: false,
   },
   terminal: false,
+  // Advertise ACP form elicitation so ACP agents (e.g. Dirac) surface
+  // follow-up questions as a first-class form instead of degrading to a
+  // generic tool_call + permission request.
+  elicitation: { form: {} },
 };
 
 export type ACPClientCapabilityMeta = Record<string, unknown>;
@@ -504,6 +518,19 @@ interface PendingPermission {
   request: AgentPermissionRequest;
   options: PermissionOption[];
   resolve: (response: RequestPermissionResponse) => void;
+  reject: (error: Error) => void;
+  turnId: string | null;
+}
+
+/**
+ * A pending ACP elicitation (form question) that the session surfaced to the
+ * user as a `kind: "question"` permission request. Resolving the permission
+ * fulfills the original `elicitation/create` request issued by the agent.
+ */
+interface PendingElicitation {
+  request: AgentPermissionRequest;
+  answerValuesByKey: Record<string, Record<string, string>>;
+  resolve: (response: ElicitationResponse) => void;
   reject: (error: Error) => void;
   turnId: string | null;
 }
@@ -1427,6 +1454,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private readonly agentId?: string;
   private readonly launchEnv?: Record<string, string>;
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
+  private readonly pendingElicitations = new Map<string, PendingElicitation>();
   private readonly pendingPermissions = new Map<string, PendingPermission>();
   private pendingUserMessage: PendingUserMessage | null = null;
   private submittedUserMessageTurnId: string | null = null;
@@ -2118,10 +2146,30 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   getPendingPermissions(): AgentPermissionRequest[] {
-    return Array.from(this.pendingPermissions.values(), (entry) => entry.request);
+    return [
+      ...Array.from(this.pendingPermissions.values(), (entry) => entry.request),
+      ...Array.from(this.pendingElicitations.values(), (entry) => entry.request),
+    ];
   }
 
   async respondToPermission(requestId: string, response: AgentPermissionResponse): Promise<void> {
+    const pendingElicitation = this.pendingElicitations.get(requestId);
+    if (pendingElicitation) {
+      this.pendingElicitations.delete(requestId);
+      const elicitationResponse = elicitationResponseFromQuestionAnswer(
+        response,
+        pendingElicitation.answerValuesByKey,
+      );
+      pendingElicitation.resolve(elicitationResponse);
+      this.pushEvent({
+        type: "permission_resolved",
+        provider: this.provider,
+        requestId,
+        resolution: response,
+        turnId: pendingElicitation.turnId ?? undefined,
+      });
+      return;
+    }
     const pending = this.pendingPermissions.get(requestId);
     if (!pending) {
       throw new Error(`No pending permission request with id '${requestId}'`);
@@ -2183,6 +2231,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       pending.resolve({ outcome: { outcome: "cancelled" } });
     }
     this.pendingPermissions.clear();
+    for (const pending of this.pendingElicitations.values()) {
+      pending.resolve({ action: "cancel" });
+    }
+    this.pendingElicitations.clear();
 
     if (this.activeForegroundTurnId) {
       await this.connection.cancel({ sessionId: this.sessionId });
@@ -2202,6 +2254,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       pending.resolve({ outcome: { outcome: "cancelled" } });
     }
     this.pendingPermissions.clear();
+    for (const pending of this.pendingElicitations.values()) {
+      pending.resolve({ action: "cancel" });
+    }
+    this.pendingElicitations.clear();
 
     if (this.connection && this.sessionId) {
       try {
@@ -2236,6 +2292,56 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.connection = null;
     this.child = null;
     this.activeForegroundTurnId = null;
+  }
+
+  /**
+   * Handle agent-initiated requests that Paseo advertises via elicitation
+   * form capabilities but that the wire SDK dispatches as extension methods.
+   *
+   * ACP agents (e.g. Dirac) surface follow-up questions as `elicitation/create`
+   * (or legacy `session/elicitation`). Paseo re-surfaces these as a native
+   * `kind: "question"` permission request so the app renders the question
+   * form instead of a tool block, then maps the answer back to the ACP
+   * elicitation response expected by the agent.
+   */
+  async extMethod(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (!ACP_ELICITATION_CREATE_METHODS.has(method)) {
+      throw new Error(`Unsupported ACP extension method: ${method}`);
+    }
+    const parsed = parseElicitationRequest(params);
+    if (!parsed || !parsed.requestedSchema) {
+      throw new Error(`Malformed ACP elicitation request for method ${method}`);
+    }
+    if (
+      parsed.sessionId !== undefined &&
+      this.sessionId !== null &&
+      parsed.sessionId !== this.sessionId
+    ) {
+      throw new Error(`Elicitation addressed to unknown session '${parsed.sessionId}'`);
+    }
+    const requestId = randomUUID();
+    const mapped = mapElicitationRequestToQuestion(this.provider, requestId, parsed);
+    const request = mapped.request;
+    const turnId = this.activeForegroundTurnId;
+    const promise = new Promise<Record<string, unknown>>((resolve, reject) => {
+      this.pendingElicitations.set(requestId, {
+        request,
+        answerValuesByKey: mapped.answerValuesByKey,
+        resolve: (response) => resolve(response),
+        reject,
+        turnId,
+      });
+    });
+    this.pushEvent({
+      type: "permission_requested",
+      provider: this.provider,
+      request,
+      turnId: turnId ?? undefined,
+    });
+    return promise;
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -3397,12 +3503,18 @@ function mapToolDetail(
   }
 }
 
-
 function extractPathFromSnapshotTitle(title: string | undefined): string | undefined {
   if (!title) return undefined;
   // Titles like 'Reading from X', 'Read from X', 'Listed files in X', 'Read image from X' -> extract X
   const fromIdx = title.indexOf(" from ");
-  if (fromIdx !== -1) return title.slice(fromIdx + 6).trim().replace(/\s*\(.*\)$/, "").replace(/\s*\(no changes\)$/, "") || undefined;
+  if (fromIdx !== -1)
+    return (
+      title
+        .slice(fromIdx + 6)
+        .trim()
+        .replace(/\s*\(.*\)$/, "")
+        .replace(/\s*\(no changes\)$/, "") || undefined
+    );
   const inIdx = title.indexOf(" in ");
   if (inIdx !== -1) return title.slice(inIdx + 4).trim() || undefined;
   // fallback: if title looks like a path (contains / or \ ), use it directly
@@ -3415,7 +3527,8 @@ function buildReadToolDetail(context: MapToolDetailContext): ToolCallDetail {
   const titlePath = extractPathFromSnapshotTitle(snapshot.title);
   // Explicit per-call locations/rawInput are authoritative; fall back to the
   // human-visible title only when neither is present.
-  const detailFilePath = firstLocation ?? readString(rawInput, ["path", "filePath", "file"]) ?? titlePath ?? "";
+  const detailFilePath =
+    firstLocation ?? readString(rawInput, ["path", "filePath", "file"]) ?? titlePath ?? "";
   return {
     type: "read",
     filePath: detailFilePath,
@@ -3552,6 +3665,168 @@ function extractTerminalContent(
     output: entry.output,
     exitCode: entry.exit?.exitCode ?? null,
   };
+}
+
+const ACP_ELICITATION_CREATE_METHODS = new Set([
+  // Agent Client Protocol transport method for agent -> client elicitation
+  // requests (variants across SDK versions).
+  "elicitation/create",
+  "session/elicitation",
+]);
+
+function isRecordish(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+interface ParsedElicitationRequest {
+  sessionId?: string;
+  toolCallId: string | null;
+  message: string;
+  requestedSchema: ElicitationSchema;
+  source: unknown;
+}
+
+function parseElicitationRequest(params: unknown): ParsedElicitationRequest | null {
+  if (!isRecordish(params)) {
+    return null;
+  }
+  const message = typeof params.message === "string" ? params.message : undefined;
+  const requestedSchema = isRecordish(params.requestedSchema)
+    ? (params.requestedSchema as ElicitationSchema)
+    : undefined;
+  if (!message || !requestedSchema) {
+    return null;
+  }
+  return {
+    sessionId: typeof params.sessionId === "string" ? params.sessionId : undefined,
+    toolCallId: typeof params.toolCallId === "string" ? params.toolCallId : null,
+    message,
+    requestedSchema,
+    source: params,
+  };
+}
+
+/** Extract a single-select enum option list from an ACP string property schema (oneOf titled options). */
+function schemaEnumOptions(property: unknown): Array<{ label: string; value: string }> | null {
+  if (!isRecordish(property)) {
+    return null;
+  }
+  const rawOptions = property.oneOf ?? property.enum;
+  if (Array.isArray(rawOptions)) {
+    const options: Array<{ label: string; value: string }> = [];
+    for (const raw of rawOptions) {
+      if (isRecordish(raw) && typeof raw.const === "string") {
+        options.push({
+          label: typeof raw.title === "string" ? raw.title : raw.const,
+          value: raw.const,
+        });
+      } else if (typeof raw === "string") {
+        options.push({ label: raw, value: raw });
+      }
+    }
+    return options.length > 0 ? options : null;
+  }
+  return null;
+}
+
+function schemaAllowsFreeText(property: unknown): boolean {
+  return (
+    !isRecordish(property) ||
+    (property.pattern ?? property.minLength ?? undefined) !== undefined ||
+    !Array.isArray(property.oneOf ?? property.enum)
+  );
+}
+
+/**
+ * Convert an ACP form elicitation into the shape Paseo's question form expects:
+ * `input.questions` with one entry per requested-schema property.
+ */
+function mapElicitationRequestToQuestion(
+  provider: string,
+  requestId: string,
+  parsed: ParsedElicitationRequest,
+): {
+  request: AgentPermissionRequest;
+  answerValuesByKey: Record<string, Record<string, string>>;
+} {
+  const schema = parsed.requestedSchema;
+  const properties = isRecordish(schema?.properties) ? schema.properties : {};
+  const required = Array.isArray(schema?.required) ? (schema.required as string[]) : [];
+
+  const answerValuesByKey: Record<string, Record<string, string>> = {};
+  const questions = Object.entries(properties).map(([key, property]) => {
+    const record: Record<string, unknown> = isRecordish(property) ? property : {};
+    const title = typeof record.title === "string" ? record.title : undefined;
+    // Use the schema property key as the question header so the answer form
+    // keys its submitted answers by that key (the agent expects the answer
+    // under the same property key in the `content` of the response).
+    const header = key;
+    const options = schemaEnumOptions(property);
+    if (options) {
+      for (const opt of options) {
+        answerValuesByKey[header] ??= {};
+        answerValuesByKey[header][opt.label] = opt.value;
+      }
+    }
+    const allowOther = !Array.isArray(options) || schemaAllowsFreeText(property);
+    const isRequired = required.includes(key);
+    const question: Record<string, unknown> = {
+      header,
+      question: title ?? key,
+      options: (options ?? []).map(({ label }) => ({ label })),
+      multiSelect: false,
+      allowOther,
+      allowEmpty: !isRequired,
+    };
+    if (typeof record.description === "string") {
+      question.placeholder = record.description;
+    }
+    return question;
+  });
+
+  return {
+    request: {
+      id: requestId,
+      provider,
+      name: "question",
+      kind: "question" as AgentPermissionRequestKind,
+      title: parsed.message,
+      input: { questions },
+      metadata: {
+        toolCallId: parsed.toolCallId,
+        elicitation: true,
+        rawRequest: parsed.source,
+      },
+    },
+    answerValuesByKey,
+  };
+}
+
+/** Convert Paseo's question-answer response back into an ACP elicitation response. */
+function elicitationResponseFromQuestionAnswer(
+  response: AgentPermissionResponse,
+  answerValuesByKey: Record<string, Record<string, string>>,
+): ElicitationResponse {
+  if (response.behavior === "deny") {
+    return { action: "decline" };
+  }
+  const answers = isRecordish(response.updatedInput?.["answers"])
+    ? (response.updatedInput["answers"] as Record<string, unknown>)
+    : undefined;
+  if (answers) {
+    const content: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(answers)) {
+      const valueMap = answerValuesByKey[key];
+      if (valueMap && typeof value === "string" && value in valueMap) {
+        // Map the displayed option label back to its ACP const value.
+        content[key] = valueMap[value];
+      } else {
+        content[key] = value;
+      }
+    }
+    return { action: "accept", content: content as Record<string, string> };
+  }
+  return { action: "decline" };
 }
 
 function mapPermissionRequest(

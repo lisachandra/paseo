@@ -59,6 +59,7 @@ describe("buildACPClientCapabilities", () => {
         writeTextFile: false,
       },
       terminal: false,
+      elicitation: { form: {} },
     });
   });
 
@@ -79,8 +80,111 @@ describe("buildACPClientCapabilities", () => {
         writeTextFile: false,
       },
       terminal: true,
+      elicitation: { form: {} },
       _meta: { source: "provider" },
     });
+  });
+});
+
+describe("ACP elicitation round-trip", () => {
+  test("surfaces an agent form elicitation as a question permission and maps the answer back", async () => {
+    const session = createSessionWithConfig({ provider: "generic-acp" });
+    const events: AgentStreamEvent[] = [];
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    session.subscribe((event) => events.push(event));
+
+    const elicitation = session.extMethod("elicitation/create", {
+      mode: "form",
+      sessionId: "session-1",
+      toolCallId: "question-1",
+      message: "Which fix do you want?",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          optionId: {
+            type: "string",
+            title: "Choose an option",
+            oneOf: [
+              { const: "narrow", title: "Narrow fix" },
+              { const: "wide", title: "Wide fix" },
+            ],
+          },
+        },
+        required: ["optionId"],
+      },
+    });
+
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    expect(requested).toBeDefined();
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+    const request = requested.request;
+    expect(request.kind).toBe("question");
+    expect(request.title).toBe("Which fix do you want?");
+    expect(request.input).toEqual({
+      questions: [
+        {
+          header: "optionId",
+          question: "Choose an option",
+          options: [{ label: "Narrow fix" }, { label: "Wide fix" }],
+          multiSelect: false,
+          allowOther: false,
+          allowEmpty: false,
+        },
+      ],
+    });
+
+    await session.respondToPermission(request.id, {
+      behavior: "allow",
+      updatedInput: {
+        ...request.input,
+        answers: { optionId: "Wide fix" },
+      },
+    });
+
+    await expect(elicitation).resolves.toEqual({
+      action: "accept",
+      content: { optionId: "wide" },
+    });
+    expect(session.getPendingPermissions()).toHaveLength(0);
+  });
+
+  test("declines the elicitation when the user dismisses the question", async () => {
+    const session = createSessionWithConfig({ provider: "generic-acp" });
+    const events: AgentStreamEvent[] = [];
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    session.subscribe((event) => events.push(event));
+
+    const elicitation = session.extMethod("elicitation/create", {
+      mode: "form",
+      sessionId: "session-1",
+      toolCallId: "question-2",
+      message: "Enter a path",
+      requestedSchema: {
+        type: "object",
+        properties: { text: { type: "string", title: "Answer", minLength: 1 } },
+        required: ["text"],
+      },
+    });
+
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    await session.respondToPermission(requested.request.id, {
+      behavior: "deny",
+      message: "Dismissed by user",
+    });
+
+    await expect(elicitation).resolves.toEqual({ action: "decline" });
   });
 });
 
