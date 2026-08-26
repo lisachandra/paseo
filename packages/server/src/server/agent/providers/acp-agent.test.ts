@@ -192,6 +192,7 @@ interface ACPSessionInternals {
   sessionId: string | null;
   connection: { prompt: (...args: unknown[]) => Promise<PromptResponse> };
   activeForegroundTurnId: string | null;
+  latestTurnId: string | null;
   configOptions: SessionConfigOption[];
   translateSessionUpdate(update: SessionUpdate): AgentStreamEvent[];
   acpMcpServers(): unknown[];
@@ -2884,6 +2885,42 @@ describe("ACPAgentSession", () => {
     expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBeNull();
   });
 
+  test("startTurn releases a stale foreground turn left by a stranded prompt", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    // A prompt that will never settle — simulates a dirac/ACP turn that was
+    // force-canceled by the manager but whose provider never answered, leaving
+    // the session-level activeForegroundTurnId stranded.
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt };
+
+    session.subscribe((event) => {
+      events.push(event);
+    });
+
+    const firstTurn = await session.startTurn("first message");
+    expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBe(firstTurn.turnId);
+
+    // Simulate the manager force-canceling: it settles its own run state, but
+    // the session-level turn is left set because the prompt never resolves.
+    // A second startTurn must release the stale turn and start a fresh one
+    // instead of throwing "A foreground turn is already active".
+    const secondTurn = await session.startTurn("second message");
+    expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBe(
+      secondTurn.turnId,
+    );
+
+    // The stale turn was reported as canceled on the timeline.
+    expect(
+      events.find((event) => event.type === "turn_canceled" && event.turnId === firstTurn.turnId),
+    ).toMatchObject({
+      type: "turn_canceled",
+      turnId: firstTurn.turnId,
+    });
+    expect(prompt).toHaveBeenCalledTimes(2);
+  });
   test("startTurn emits the submitted user message even when ACP does not echo it", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];

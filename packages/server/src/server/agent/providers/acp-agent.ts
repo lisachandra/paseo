@@ -1484,6 +1484,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
   private currentTurnUsage: AgentUsage | undefined;
   private activeForegroundTurnId: string | null = null;
+  private latestTurnId: string | null = null;
   private fallbackAssistantMessageId: string | null = null;
   private closed = false;
   private historyPending = false;
@@ -1643,14 +1644,30 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (!this.connection || !this.sessionId) {
       throw new Error(`${this.provider} session is not initialized`);
     }
+    // The manager's streamAgent guard guarantees startTurn() is never called
+    // while a run is already active, so any turn still set here is stale — a
+    // previous prompt was force-canceled because its provider never answered,
+    // leaving this turn set but with no live prompt. Release it (emit a
+    // turn_canceled for the timeline) instead of throwing "A foreground turn
+    // is already active" forever, which left this agent un-resumable.
     if (this.activeForegroundTurnId) {
-      throw new Error("A foreground turn is already active");
+      const staleTurnId = this.activeForegroundTurnId;
+      this.deliverTranslatedEvents(this.flushPendingUserMessage());
+      this.activeForegroundTurnId = null;
+      this.fallbackAssistantMessageId = null;
+      this.pushEvent({
+        type: "turn_canceled",
+        provider: this.provider,
+        reason: "stale turn released",
+        turnId: staleTurnId,
+      });
     }
 
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     const turnId = randomUUID();
     const messageId = options?.clientMessageId ?? randomUUID();
     this.activeForegroundTurnId = turnId;
+    this.latestTurnId = turnId;
     this.fallbackAssistantMessageId = null;
     this.submittedUserMessageTurnId = null;
     this.emitBootstrapThreadEvent();
@@ -3069,9 +3086,17 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private finishTurn(
     event: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
   ): void {
+    // Ignore responses for turns that are no longer current. A force-canceled
+    // turn leaves its prompt promise pending, and its response may arrive late
+    // — after a newer turn has already started. Without this guard, that late
+    // finishTurn would clear the newer turn's state.
+    if (this.latestTurnId && event.turnId !== this.latestTurnId) {
+      return;
+    }
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     this.activeForegroundTurnId = null;
     this.fallbackAssistantMessageId = null;
+    this.latestTurnId = null;
     if (this.submittedUserMessageTurnId === event.turnId) {
       this.submittedUserMessageTurnId = null;
     }
