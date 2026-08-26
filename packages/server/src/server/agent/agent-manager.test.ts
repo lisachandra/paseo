@@ -657,6 +657,60 @@ test("uses an injected timeline store without making it a production requirement
   }
 });
 
+test("resume from a durable timeline seeds the in-memory store so history is not empty", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-durable-resume-rows-"));
+  const store = new RecordingTimelineStore();
+  const firstManager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    durableTimelineStore: store,
+    logger,
+  });
+  let agentId: string | null = null;
+  try {
+    const created = await firstManager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = created.id;
+    await firstManager.appendTimelineItem(created.id, {
+      type: "user_message",
+      text: "durable prompt",
+      clientMessageId: "durable-client",
+    });
+    await firstManager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "durable answer",
+    });
+    await firstManager.flush();
+    expect(store.writes.flat().length).toBeGreaterThan(0);
+
+    // A brand-new manager shares the same durable store (a daemon restart). The
+    // provider session produces no history: historyPrimed must be satisfied by
+    // loading the durable rows into memory, not by skipping hydration into an
+    // empty store.
+    const restarted = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      durableTimelineStore: store,
+      logger,
+    });
+    const resumed = await restarted.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: "durable-resume-session" },
+      { cwd: workdir },
+      agentId,
+    );
+
+    await restarted.hydrateTimelineFromProvider(resumed.id);
+    const timeline = restarted.fetchTimeline(resumed.id, { limit: 0 }).rows;
+    const texts = timeline
+      .filter((row) => row.item.type === "user_message" || row.item.type === "assistant_message")
+      .map((row) => row.item.text);
+    expect(texts).toEqual(["durable prompt", "durable answer"]);
+    await restarted.closeAgent(resumed.id);
+  } finally {
+    if (agentId) await firstManager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("retries provider history hydration after a stream failure", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-retry-"));
   let attempts = 0;

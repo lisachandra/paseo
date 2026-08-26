@@ -3301,7 +3301,22 @@ export class AgentManager {
     if (!this.durableTimelineStore) {
       return { timestamp: now.toISOString() };
     }
+    // Seed the in-memory timeline with the durable rows (and its epoch) so
+    // historyPrimed=true stays accurate: the memory store is what serves
+    // fetch_agent_timeline, and it must not be left empty just because a
+    // durable transcript exists on disk. Without the rows, the resume path
+    // sets historyPrimed=true, skips provider hydration, and the app sees an
+    // empty conversation.
+    const committed = await this.durableTimelineStore.fetchCommitted(agentId, {
+      direction: "tail",
+      limit: 0,
+    });
+    if (committed.rows.length === 0) {
+      return { timestamp: now.toISOString() };
+    }
     return {
+      rows: committed.rows,
+      epoch: committed.epoch,
       nextSeq: (await this.durableTimelineStore.getLatestCommittedSeq(agentId)) + 1,
       timestamp: now.toISOString(),
     };
@@ -3559,7 +3574,9 @@ export class AgentManager {
   ): Promise<void> {
     try {
       const newInfo = await agent.session.getRuntimeInfo();
-      const titleChanged = (newInfo.extra?.title as string | undefined) !== (agent.runtimeInfo?.extra?.title as string | undefined);
+      const titleChanged =
+        (newInfo.extra?.title as string | undefined) !==
+        (agent.runtimeInfo?.extra?.title as string | undefined);
       const changed =
         newInfo.model !== agent.runtimeInfo?.model ||
         newInfo.thinkingOptionId !== agent.runtimeInfo?.thinkingOptionId ||
