@@ -1,5 +1,6 @@
 import { router, useLocalSearchParams } from "expo-router";
-import type { PluginSurfaceProps, PluginTheme } from "@getpaseo/plugin";
+import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
+import type { PluginTheme } from "@getpaseo/plugin";
 import { ChevronDown, X } from "lucide-react-native";
 import { useCallback, useMemo, useRef, useState, type ComponentType } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
@@ -13,13 +14,14 @@ import { useIsCompactFormFactor } from "@/constants/layout";
 import { useHostRuntimeClient, useHosts } from "@/runtime/host-runtime";
 import type { Theme } from "@/styles/theme";
 import type { ShortcutKey } from "@/utils/format-shortcut";
+import { usePluginHostNavigation } from "./host-navigation";
 import { resolvePluginIcon } from "./icons";
 import { toPluginTheme } from "./theme";
 import { useInstalledPlugin, usePluginInstallations } from "./registry";
 import { buildPluginSurfaceRoute } from "./routes";
 import { rememberPluginContributionHost } from "./contribution-host";
 import { SurfaceErrorBoundary } from "./surface-error-boundary";
-import { createPluginSurfaceRuntime } from "./surface-runtime";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { PluginRuntimeBoundary } from "./runtime-boundary";
 import {
   getPluginSurfaceContributionServerIds,
@@ -53,22 +55,23 @@ const ThemedPluginHeaderIcon = withUnistyles(PluginHeaderIcon);
 
 function SurfaceRenderer({
   Surface,
-  runtime,
+  client,
   plugin,
   layout,
   host,
   theme,
 }: {
   Surface: ComponentType<PluginSurfaceProps>;
-  runtime: NonNullable<ReturnType<typeof createPluginSurfaceRuntime>>;
+  client: DaemonClient;
   plugin: NonNullable<ReturnType<typeof useInstalledPlugin>>;
   layout: PluginSurfaceProps["layout"];
   host: PluginSurfaceProps["host"];
   theme: PluginTheme;
 }) {
+  const navigation = usePluginHostNavigation(host.id);
   return (
-    <PluginRuntimeBoundary plugin={plugin} runtime={runtime}>
-      <Surface theme={theme} host={host} layout={layout} />
+    <PluginRuntimeBoundary plugin={plugin} client={client}>
+      <Surface theme={theme} host={host} layout={layout} navigation={navigation} />
     </PluginRuntimeBoundary>
   );
 }
@@ -159,7 +162,6 @@ export function PluginSurfaceScreen() {
   const installations = usePluginInstallations(pluginId);
   const hosts = useHosts();
   const client = useHostRuntimeClient(serverId);
-  const runtime = useMemo(() => createPluginSurfaceRuntime(client, pluginId), [client, pluginId]);
   const compact = useIsCompactFormFactor();
   const { sidebarItem, surface } = useMemo(
     () => resolvePluginSurfaceContribution(plugin, identity),
@@ -222,7 +224,7 @@ export function PluginSurfaceScreen() {
     <View style={styles.screen}>
       <ScreenHeader left={headerLeft} right={headerRight} />
       <View style={styles.body}>
-        {plugin && surface && runtime ? (
+        {plugin && surface && client ? (
           <SurfaceErrorBoundary
             key={`${serverId}/${pluginId}/${identity?.kind}/${contributionId}`}
             installation={plugin}
@@ -230,7 +232,7 @@ export function PluginSurfaceScreen() {
           >
             <ThemedSurfaceRenderer
               Surface={surface.Component}
-              runtime={runtime}
+              client={client}
               plugin={plugin}
               host={host}
               layout={layout}

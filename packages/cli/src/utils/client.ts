@@ -1,5 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
-import { loadConfig, resolvePaseoHome } from "@getpaseo/server";
+import { waitForDaemonReady, resolvePaseoHome, type DaemonInstance } from "@getpaseo/server";
+import { describeDaemonTarget, type DaemonTarget } from "./daemon-target.js";
+export type { DaemonTarget } from "./daemon-target.js";
 import {
   buildDaemonWebSocketUrl,
   buildRelayWebSocketUrl,
@@ -11,55 +12,46 @@ import {
   parseConnectionOfferFromUrl,
   type ConnectionOffer,
 } from "@getpaseo/protocol/connection-offer";
+import { parseSshTransportUri } from "@getpaseo/protocol/ssh-transport";
 import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
-import path from "node:path";
 import { WebSocket } from "ws";
 import { getOrCreateCliClientId } from "./client-id.js";
 import { resolveCliVersion } from "../version.js";
+import { createSshTunnel } from "../ssh/ssh-tunnel.js";
 
 export interface ConnectOptions {
-  host?: string;
+  target: DaemonTarget;
   timeout?: number;
+  instance?: DaemonInstance;
 }
-
-export interface DaemonConnectionCommandError {
-  code: "DAEMON_NOT_RUNNING";
-  message: string;
-  details: string;
-}
-
-const DEFAULT_HOST = "localhost:6767";
 const DEFAULT_TIMEOUT = 15000;
-const PID_FILENAME = "paseo.pid";
+type TransportTarget =
+  | { type: "tcp"; url: string }
+  | { type: "ipc"; url: string; socketPath: string };
 
-type DaemonTarget =
-  | {
-      type: "tcp";
-      url: string;
-    }
-  | {
-      type: "ipc";
-      url: string;
-      socketPath: string;
-    };
-
-/**
- * Get the daemon host from environment or options
- */
-export function getDaemonHost(options?: ConnectOptions): string {
-  return resolveDaemonHostCandidates(options)[0] ?? DEFAULT_HOST;
+export function getDaemonHost(options: ConnectOptions): string {
+  return describeDaemonTarget(options.target);
 }
 
-export function buildDaemonConnectionCommandError(options: {
-  host?: string;
-  error: unknown;
-}): DaemonConnectionCommandError {
-  const host = getDaemonHost({ host: options.host });
-  const message = options.error instanceof Error ? options.error.message : String(options.error);
+export function buildDaemonConnectionCommandError(options: ConnectOptions & { error: unknown }) {
+  const error = options.error;
+  let message = error instanceof Error ? error.message : String(error);
+  if (error && typeof error === "object" && "message" in error) message = String(error.message);
+  if (options.target.kind === "endpoint")
+    message = message.replaceAll(options.target.host, describeDaemonTarget(options.target));
+  if (message.startsWith("Cannot connect to daemon at "))
+    return error as { code: string; message: string; details: string };
+  let code = "DAEMON_UNREACHABLE";
+  if (typeof error === "object" && error !== null && "code" in error) code = String(error.code);
+  else if (message === "Password required") code = "AUTH_REQUIRED";
+  else if (message === "Incorrect password") code = "AUTH_FAILED";
   return {
-    code: "DAEMON_NOT_RUNNING",
-    message: `Cannot connect to daemon at ${host}: ${message}`,
-    details: "Start the daemon with: paseo daemon start",
+    code,
+    message: `Cannot connect to daemon at ${describeDaemonTarget(options.target)}: ${message}`,
+    details:
+      options.target.kind === "instance"
+        ? `Start with: paseo daemon start --home ${JSON.stringify(options.target.home)}`
+        : "Check the selected endpoint and credentials. SSH transport does not install or start the daemon.",
   };
 }
 
@@ -114,92 +106,13 @@ export function normalizeDaemonHost(raw: string): string | null {
   return trimmed.includes(":") ? trimmed : null;
 }
 
-export function resolveDefaultDaemonHost(env: NodeJS.ProcessEnv = process.env): string {
-  return resolveDefaultDaemonHosts(env)[0] ?? DEFAULT_HOST;
-}
-
-function isIpcDaemonHost(host: string | null): host is string {
-  return host !== null && (host.startsWith("unix://") || host.startsWith("pipe://"));
-}
-
-function isTcpDaemonHost(host: string | null): host is string {
-  return host !== null && !isIpcDaemonHost(host);
-}
-
-function readPidSocketTarget(paseoHome: string): string | null {
-  const pidPath = path.join(paseoHome, PID_FILENAME);
-  if (!existsSync(pidPath)) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(readFileSync(pidPath, "utf-8")) as {
-      listen?: unknown;
-      sockPath?: unknown;
-    };
-    if (typeof parsed.listen === "string") return parsed.listen;
-    if (typeof parsed.sockPath === "string") return parsed.sockPath;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function resolveConfiguredIpcDaemonHost(env: NodeJS.ProcessEnv, paseoHome: string): string | null {
-  const directEnvHost = normalizeDaemonHost(env.PASEO_LISTEN ?? "");
-  if (isIpcDaemonHost(directEnvHost)) {
-    return directEnvHost;
-  }
-
-  const pidHost = normalizeDaemonHost(readPidSocketTarget(paseoHome) ?? "");
-  if (isIpcDaemonHost(pidHost)) {
-    return pidHost;
-  }
-
-  const config = loadConfig(paseoHome, { env });
-  const configuredHost = normalizeDaemonHost(config.listen);
-  return isIpcDaemonHost(configuredHost) ? configuredHost : null;
-}
-
-function resolveConfiguredTcpDaemonHost(env: NodeJS.ProcessEnv, paseoHome: string): string | null {
-  const configuredHost = normalizeDaemonHost(loadConfig(paseoHome, { env }).listen);
-  if (!isTcpDaemonHost(configuredHost)) {
-    return null;
-  }
-  return configuredHost === "127.0.0.1:6767" ? null : configuredHost;
-}
-
-export function resolveDefaultDaemonHosts(env: NodeJS.ProcessEnv = process.env): string[] {
-  const paseoHome = resolvePaseoHome(env);
-  const candidates: string[] = [];
-  const configuredIpcHost = resolveConfiguredIpcDaemonHost(env, paseoHome);
-  if (configuredIpcHost) {
-    candidates.push(configuredIpcHost);
-  }
-  const configuredTcpHost = resolveConfiguredTcpDaemonHost(env, paseoHome);
-  if (configuredTcpHost) {
-    candidates.push(configuredTcpHost);
-  }
-  candidates.push(DEFAULT_HOST);
-  return Array.from(new Set(candidates));
-}
-
-function resolveDaemonHostCandidates(options?: ConnectOptions): string[] {
-  const explicitHost = options?.host ?? process.env.PASEO_HOST;
-  if (explicitHost) {
-    return [explicitHost];
-  }
-
-  return resolveDefaultDaemonHosts();
-}
-
 function stripIpcPrefix(trimmed: string): string {
   if (trimmed.startsWith("unix://")) return trimmed.slice("unix://".length).trim();
   if (trimmed.startsWith("pipe://")) return trimmed.slice("pipe://".length).trim();
   return trimmed;
 }
 
-export function resolveDaemonTarget(host: string): DaemonTarget {
+export function resolveDaemonTarget(host: string): TransportTarget {
   const trimmed = normalizeDaemonHost(host);
   if (!trimmed) {
     throw new Error(`Invalid daemon target: ${host}`);
@@ -351,40 +264,82 @@ function parseHostOfferOrNull(host: string | undefined): ConnectionOffer | null 
   }
 }
 
-export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonClient> {
-  const timeout = options?.timeout ?? DEFAULT_TIMEOUT;
-  const clientId = await getOrCreateCliClientId();
+async function connectSelectedDaemon(options: ConnectOptions): Promise<DaemonClient> {
+  const timeout = options.timeout ?? DEFAULT_TIMEOUT;
+  const deadline = Date.now() + timeout;
+  const explicitHost =
+    options.target.kind === "endpoint"
+      ? options.target.host
+      : (
+          await waitForDaemonReady(options.target.home, {
+            timeoutMs: timeout,
+            instance: options.instance,
+          })
+        ).listen;
+  const clientId = await getOrCreateCliClientId(resolvePaseoHome({}));
   const nodeWebSocketFactory = createNodeWebSocketFactory();
 
-  const explicitHost = options?.host ?? process.env.PASEO_HOST;
-  const offer = parseHostOfferOrNull(explicitHost);
-  if (offer) {
-    return connectViaRelayOffer(offer, clientId, timeout, nodeWebSocketFactory);
-  }
-
-  const hosts = resolveDaemonHostCandidates(options);
-
-  async function tryNext(index: number, lastError: unknown): Promise<DaemonClient> {
-    if (index >= hosts.length) {
-      if (lastError instanceof Error) throw lastError;
-      throw new Error(`Unable to connect to Paseo daemon via ${hosts.join(", ")}`);
-    }
-    const host = hosts[index];
-    const password = resolveDaemonPassword(host);
-    const result = await tryConnectHost(host, password, clientId, timeout, nodeWebSocketFactory);
+  if (explicitHost?.trim().startsWith("ssh://")) {
+    const target = parseSshTransportUri(explicitHost.trim());
+    const tunnel = await createSshTunnel(target);
+    const password = resolveDaemonPassword(explicitHost);
+    const result = await tryConnectHost(
+      tunnel.endpoint,
+      password,
+      clientId,
+      Math.max(1, deadline - Date.now()),
+      nodeWebSocketFactory,
+    );
     if ("client" in result) {
+      const close = result.client.close.bind(result.client);
+      result.client.close = async () => {
+        try {
+          await close();
+        } finally {
+          tunnel.close();
+        }
+      };
       return result.client;
     }
-    return tryNext(index + 1, result.error);
+
+    const failure = tunnel.failureDetail();
+    tunnel.close();
+    if (failure) throw new Error(`SSH connection failed: ${failure}`, { cause: result.error });
+    throw result.error;
+  }
+  const offer = parseHostOfferOrNull(explicitHost);
+  if (offer) {
+    return connectViaRelayOffer(
+      offer,
+      clientId,
+      Math.max(1, deadline - Date.now()),
+      nodeWebSocketFactory,
+    );
   }
 
-  return tryNext(0, null);
+  const result = await tryConnectHost(
+    explicitHost,
+    resolveDaemonPassword(explicitHost),
+    clientId,
+    Math.max(1, deadline - Date.now()),
+    nodeWebSocketFactory,
+  );
+  if ("client" in result) return result.client;
+  throw result.error;
+}
+
+export async function connectToDaemon(options: ConnectOptions): Promise<DaemonClient> {
+  try {
+    return await connectSelectedDaemon(options);
+  } catch (error) {
+    throw buildDaemonConnectionCommandError({ ...options, error });
+  }
 }
 
 /**
  * Try to connect to the daemon, returns null if connection fails
  */
-export async function tryConnectToDaemon(options?: ConnectOptions): Promise<DaemonClient | null> {
+export async function tryConnectToDaemon(options: ConnectOptions): Promise<DaemonClient | null> {
   try {
     return await connectToDaemon(options);
   } catch {

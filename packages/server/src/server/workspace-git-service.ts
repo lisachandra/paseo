@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { LRUCache } from "lru-cache";
+import { CheckoutDiffCache } from "./checkout-diff-cache.js";
 import pLimit from "p-limit";
 import type pino from "pino";
 import type { ProjectCheckoutLitePayload } from "@getpaseo/protocol/messages";
@@ -31,6 +32,7 @@ import type {
   ForgeAuthState,
   ForgeService,
   ForgeSpecificStatusFacts,
+  PullRequestCheck,
   PullRequestMergeable,
 } from "../services/forge-service.js";
 import { createForgeService } from "../services/forge-registry.js";
@@ -45,7 +47,11 @@ import {
   getRealpathAwareRelativePath,
   isRealpathInsideRoot,
 } from "../utils/path.js";
-import { runGitCommand } from "../utils/run-git-command.js";
+import {
+  createRunGitCommand,
+  runGitCommand,
+  type RunGitCommand,
+} from "../utils/run-git-command.js";
 import { branchNameFromRef } from "../utils/worktree-metadata.js";
 import { listPaseoWorktrees, type PaseoWorktreeInfo } from "../utils/worktree.js";
 import { READ_ONLY_GIT_ENV } from "./checkout-git-utils.js";
@@ -89,8 +95,6 @@ const WATCH_RECOVERY_MAX_ATTEMPTS = 3;
 const WORKSPACE_GIT_AUXILIARY_READ_TTL_MS = 15_000;
 // Non-forced refresh triggers share this minimum gap to absorb watcher/self-heal bursts; force bypasses it.
 const WORKSPACE_GIT_INTERNAL_MIN_GAP_MS = 2_000;
-// Heavy values (multi-MB highlighted diffs); cap aggressively. Ephemeral worktree cwds would otherwise pile up forever.
-const WORKSPACE_GIT_CHECKOUT_DIFF_CACHE_MAX = 64;
 // Small values (booleans, short strings, small arrays); generous cap.
 const WORKSPACE_GIT_AUXILIARY_CACHE_MAX = 256;
 
@@ -159,13 +163,7 @@ export interface WorkspaceGitRuntimeSnapshot {
       isMerged: boolean;
       isDraft?: boolean;
       mergeable?: PullRequestMergeable;
-      checks?: Array<{
-        name: string;
-        status: "success" | "failure" | "pending" | "skipped" | "cancelled";
-        url: string | null;
-        workflow?: string;
-        duration?: string;
-      }>;
+      checks?: PullRequestCheck[];
       checksStatus?: "none" | "pending" | "success" | "failure";
       reviewDecision?: "approved" | "changes_requested" | "pending" | null;
       forgeSpecific?: ForgeSpecificStatusFacts;
@@ -356,6 +354,7 @@ interface WorkspaceGitServiceDependencies {
   runGitFetch: (
     cwd: string,
     observer: WorkspaceGitFetchObserver,
+    runGitCommand: RunGitCommand,
   ) => Promise<WorkspaceGitFetchResult>;
   runGitCommand: typeof runGitCommand;
   getWorkspaceGitSelfHealPhaseMs: typeof getWorkspaceGitObservationReensurePhaseMs;
@@ -566,10 +565,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     string,
     WorkspaceGitAuxiliaryReadCacheEntry<string>
   >({ max: WORKSPACE_GIT_AUXILIARY_CACHE_MAX });
-  private readonly checkoutDiffCache = new LRUCache<
-    string,
-    WorkspaceGitAuxiliaryReadCacheEntry<CheckoutDiffResult>
-  >({ max: WORKSPACE_GIT_CHECKOUT_DIFF_CACHE_MAX });
+  private readonly checkoutDiffCache = new CheckoutDiffCache(() => this.deps.now().getTime());
   private watcherErrorCallbackCount = 0;
   constructor(options: WorkspaceGitServiceOptions) {
     this.logger = options.logger.child({ module: "workspace-git-service" });
@@ -726,7 +722,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return this.workspaceTargets.get(cwd)?.latestSnapshot ?? null;
   }
 
-  getCheckoutDiff(
+  async getCheckoutDiff(
     cwd: string,
     options: CheckoutDiffCompare,
     readOptions?: WorkspaceGitReadOptions,
@@ -734,13 +730,20 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
     const normalizedOptions = this.normalizeCheckoutDiffOptions(options);
-    const key = this.buildCheckoutDiffCacheKey(normalizedCwd, normalizedOptions);
-    return this.readAuxiliaryCache(this.checkoutDiffCache, key, readOptions, () =>
-      this.deps.getCheckoutDiff(normalizedCwd, normalizedOptions, {
-        paseoHome: this.paseoHome,
-        worktreesRoot: this.worktreesRoot,
-      }),
-    );
+    // Initial inventory events cover the watcher setup gap. Process them before
+    // starting a cold diff, rather than invalidating that build halfway through.
+    await this.workspaceTargets.get(normalizedCwd)?.observationSetupPromise;
+    this.assertNotDisposed();
+    return this.checkoutDiffCache.read({
+      cwd: normalizedCwd,
+      compare: normalizedOptions,
+      ...readOptions,
+      load: () =>
+        this.deps.getCheckoutDiff(normalizedCwd, normalizedOptions, {
+          paseoHome: this.paseoHome,
+          worktreesRoot: this.worktreesRoot,
+        }),
+    });
   }
 
   private normalizeCheckoutDiffOptions(options: CheckoutDiffCompare): CheckoutDiffCompare {
@@ -754,26 +757,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     };
   }
 
-  private buildCheckoutDiffCacheKey(cwd: string, options: CheckoutDiffCompare): string {
-    // Diff content varies by compare signature. Keep the cache per exact diff read shape so
-    // hot diff panes coalesce while base refs and rendering options never share stale patches.
-    return JSON.stringify([
-      "checkout-diff",
-      cwd,
-      options.mode,
-      options.mode === "base" ? (options.baseRef ?? null) : null,
-      options.ignoreWhitespace === true,
-      options.includeStructured === true,
-    ]);
-  }
-
   private invalidateCheckoutDiffCache(cwd: string, mode: CheckoutDiffCompare["mode"]): void {
-    for (const key of this.checkoutDiffCache.keys()) {
-      const [kind, cachedCwd, cachedMode] = JSON.parse(key) as unknown[];
-      if (kind === "checkout-diff" && cachedCwd === cwd && cachedMode === mode) {
-        this.checkoutDiffCache.delete(key);
-      }
-    }
+    this.checkoutDiffCache.invalidate(cwd, mode);
   }
 
   validateBranchRef(
@@ -2781,11 +2766,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         });
       }
       try {
+        const runRefreshGitCommand = createRunGitCommand(`workspace-refresh:${request.reason}`);
         const admittedSnapshot = await this.workspaceRefreshLimit(() => {
           if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
             return null;
           }
-          return this.refreshSnapshot(target, request);
+          return this.refreshSnapshot(target, request, runRefreshGitCommand);
         });
         if (!admittedSnapshot) {
           break;
@@ -2824,12 +2810,18 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private async refreshSnapshot(
     target: WorkspaceGitTarget,
     request: WorkspaceGitRefreshRequest,
+    runRefreshGitCommand: RunGitCommand,
   ): Promise<WorkspaceGitRuntimeSnapshot> {
     let facts = target.latestFacts;
     if (request.movedRemoteRefs.size > 0 && !request.refreshStructure && !request.refreshWorktree) {
       if (facts?.isGit && target.latestGit?.isGit) {
         try {
-          await this.refreshRefDerivedSnapshot(target, facts, request.movedRemoteRefs);
+          await this.refreshRefDerivedSnapshot(
+            target,
+            facts,
+            request.movedRemoteRefs,
+            runRefreshGitCommand,
+          );
           return this.combineSnapshot(target);
         } catch (error) {
           this.logger.debug(
@@ -2838,23 +2830,27 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           );
         }
       }
-      facts = await this.refreshGitSnapshot(target, {
-        ...request,
-        refreshStructure: true,
-        refreshWorktree: true,
-      });
+      facts = await this.refreshGitSnapshot(
+        target,
+        {
+          ...request,
+          refreshStructure: true,
+          refreshWorktree: true,
+        },
+        runRefreshGitCommand,
+      );
       return this.combineSnapshot(target);
     }
     if (request.refreshStructure || !facts || !target.latestGit) {
-      facts = await this.refreshGitSnapshot(target, request);
+      facts = await this.refreshGitSnapshot(target, request, runRefreshGitCommand);
     } else if (request.refreshWorktree) {
-      await this.refreshWorktreeSnapshot(target, facts);
+      await this.refreshWorktreeSnapshot(target, facts, runRefreshGitCommand);
     }
     if (!facts) {
-      facts = await this.refreshGitSnapshot(target, request);
+      facts = await this.refreshGitSnapshot(target, request, runRefreshGitCommand);
     }
     if (request.includeForge) {
-      await this.refreshForgeSnapshot(target, request, facts);
+      await this.refreshForgeSnapshot(target, request, facts, runRefreshGitCommand);
     }
 
     const snapshot = this.combineSnapshot(target);
@@ -2866,6 +2862,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target: WorkspaceGitTarget,
     facts: Extract<CheckoutSnapshotFacts, { isGit: true }>,
     movedRemoteRefs: ReadonlySet<string>,
+    runRefreshGitCommand: RunGitCommand,
   ): Promise<void> {
     const latestGit = target.latestGit;
     if (!latestGit?.isGit) {
@@ -2877,7 +2874,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       facts,
       { aheadBehind: latestGit.aheadBehind, diffStat: latestGit.diffStat },
       movedRemoteRefs,
-      { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot, logger: this.logger, facts },
+      {
+        paseoHome: this.paseoHome,
+        worktreesRoot: this.worktreesRoot,
+        logger: this.logger,
+        facts,
+        runGitCommand: runRefreshGitCommand,
+      },
     );
     target.latestFacts = { ...facts, upstreamStatus: derived.upstreamStatus };
     target.latestGit = {
@@ -2895,6 +2898,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private async refreshWorktreeSnapshot(
     target: WorkspaceGitTarget,
     facts: CheckoutSnapshotFacts,
+    runRefreshGitCommand: RunGitCommand,
   ): Promise<void> {
     const latestGit = target.latestGit;
     if (!latestGit || !facts.isGit) {
@@ -2907,6 +2911,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       worktreesRoot: this.worktreesRoot,
       logger: this.logger,
       facts,
+      runGitCommand: runRefreshGitCommand,
     };
     const worktree = await this.deps.getCheckoutWorktreeState(target.cwd, context);
     target.latestGit = {
@@ -2921,6 +2926,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private async refreshGitSnapshot(
     target: WorkspaceGitTarget,
     request: WorkspaceGitRefreshRequest,
+    runRefreshGitCommand: RunGitCommand,
   ): Promise<CheckoutSnapshotFacts> {
     const now = this.deps.now();
     target.lastShellOutAtMs = now.getTime();
@@ -2931,6 +2937,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
       logger: this.logger,
+      runGitCommand: runRefreshGitCommand,
     };
     const facts = await this.loadCheckoutFacts(target, baseContext);
     const context: CheckoutContext = { ...baseContext, facts };
@@ -2985,6 +2992,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target: WorkspaceGitTarget,
     request: WorkspaceGitRefreshRequest,
     facts: CheckoutSnapshotFacts,
+    runRefreshGitCommand: RunGitCommand,
   ): Promise<void> {
     const remoteUrl = target.latestGit?.remoteUrl ?? null;
     const resolution = await this.forgeResolver.resolveFromRemoteUrlAsync(remoteUrl);
@@ -3011,6 +3019,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       force: forceForge,
       reason: request.reason,
       facts,
+      runGitCommand: runRefreshGitCommand,
     });
     // Carry the resolved forge (probe-aware) so the wire projection labels
     // self-managed GitLab hosts correctly instead of falling back to "github".
@@ -3117,22 +3126,36 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     let result: WorkspaceGitFetchResult | null = null;
     const eventsBeforeFetchSnapshot: FileChange[] = [];
     try {
-      result = await this.deps.runGitFetch(target.cwd, {
-        onRefSnapshot: (phase) => {
-          const events = target.bufferedFetchMetadataEvents.splice(0);
-          if (phase === "before") {
-            eventsBeforeFetchSnapshot.push(...events);
-          }
-        },
-      });
-    } catch (error) {
-      this.logger.warn(
-        { err: error, repoGitRoot: target.repoGitRoot, cwd: target.cwd },
-        "Background git fetch failed",
-      );
+      try {
+        result = await this.deps.runGitFetch(
+          target.cwd,
+          {
+            onRefSnapshot: (phase) => {
+              const events = target.bufferedFetchMetadataEvents.splice(0);
+              if (phase === "before") {
+                eventsBeforeFetchSnapshot.push(...events);
+              }
+            },
+          },
+          createRunGitCommand("background-fetch"),
+        );
+      } catch (error) {
+        this.logger.warn(
+          { err: error, repoGitRoot: target.repoGitRoot, cwd: target.cwd },
+          "Background git fetch failed",
+        );
+      }
+      this.applyRepoFetchResult(target, result, eventsBeforeFetchSnapshot);
     } finally {
       target.fetchInFlight = false;
     }
+  }
+
+  private applyRepoFetchResult(
+    target: RepoGitTarget,
+    result: WorkspaceGitFetchResult | null,
+    eventsBeforeFetchSnapshot: FileChange[],
+  ): void {
     this.flushFetchMetadataEvents(target, eventsBeforeFetchSnapshot);
     if (!result || result.changes === null) {
       target.recentFetchRemoteRefChanges.clear();
@@ -3358,6 +3381,7 @@ async function loadForgeSnapshot(options: {
   force?: boolean;
   reason?: string;
   facts?: CheckoutSnapshotFacts;
+  runGitCommand: RunGitCommand;
 }): Promise<WorkspaceGitRuntimeSnapshot["forge"]> {
   const forgeService = options.forgeService;
   if (!forgeService) {
@@ -3384,7 +3408,7 @@ async function loadForgeSnapshot(options: {
         force: options.force,
         reason: options.reason,
       },
-      { facts: options.facts },
+      { facts: options.facts, runGitCommand: options.runGitCommand },
     );
     return buildForgeSnapshot(result.authState, result.status, null);
   } catch (error) {

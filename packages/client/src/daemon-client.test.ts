@@ -14,9 +14,6 @@ import {
   FileTransferOpcode,
 } from "@getpaseo/protocol/binary-frames/index";
 import {
-  asUint8Array,
-  decodeTerminalResizePayload,
-  decodeTerminalStreamFrame,
   encodeTerminalSnapshotPayload,
   encodeTerminalStreamFrame,
   TerminalStreamOpcode,
@@ -79,7 +76,7 @@ function createMockTransport() {
     },
     close: () => {},
     onMessage: (handler) => {
-      onMessage = handler;
+      onMessage = (data) => handler(data, typeof data !== "string");
       return () => {};
     },
     onOpen: (handler) => {
@@ -115,7 +112,7 @@ function createMockTransport() {
               serverId: `srv_test_${serverInfoOrdinal++}`,
               hostname: null,
               version: null,
-              ...(options?.features ? { features: options.features } : {}),
+              features: options?.features ?? { ownedSubscriptions: true },
             },
           },
         }),
@@ -255,11 +252,11 @@ test("does not infer browser automation capabilities from Electron runtime", asy
   const hello = z
     .object({
       type: z.literal("hello"),
-      capabilities: z.record(z.unknown()),
+      capabilities: z.record(z.string(), z.unknown()),
     })
     .parse(JSON.parse(assertStr(mock.sent[0])));
   expect(hello.capabilities[CLIENT_CAPS.browserHost]).toBeUndefined();
-  expect(hello.capabilities[CLIENT_CAPS.selectiveAgentTimeline]).toBeUndefined();
+  expect(hello.capabilities[CLIENT_CAPS.selectiveAgentTimeline]).toBe(true);
 });
 
 test("advertises consumer-provided browser automation capabilities", async () => {
@@ -285,13 +282,31 @@ test("advertises consumer-provided browser automation capabilities", async () =>
   const hello = z
     .object({
       type: z.literal("hello"),
-      capabilities: z.record(z.unknown()),
+      capabilities: z.record(z.string(), z.unknown()),
     })
     .parse(JSON.parse(assertStr(mock.sent[0])));
   expect(hello.capabilities[CLIENT_CAPS.browserHost]).toEqual({
     supportedCommands: [...BROWSER_AUTOMATION_COMMAND_NAMES],
     hostKind: "desktop app",
   });
+});
+
+test("retry-safe creation rejects older hosts before sending any request", async () => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "receipt-gate",
+    transportFactory: () => transport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  transport.triggerOpen();
+  await connecting;
+  await expect(
+    client.createAgent({ provider: "codex", cwd: "/project", idempotencyKey: "creation" }),
+  ).rejects.toThrow("Update the host to use retry-safe agent creation.");
+  expect(transport.sent).toEqual([]);
 });
 
 test("Hub management requires daemon support before dispatching requests", async () => {
@@ -313,57 +328,35 @@ test("Hub management requires daemon support before dispatching requests", async
   expect(mock.sent).toEqual([]);
 });
 
-test("sets the complete viewed timeline subscription only when the daemon supports it", async () => {
-  const supportedTransport = createMockTransport();
-  const supportedClient = new DaemonClient({
-    url: "ws://test",
-    clientId: "timeline_supported",
-    transportFactory: () => supportedTransport.transport,
-    reconnect: { enabled: false },
-  });
-  const legacyTransport = createMockTransport();
-  const legacyClient = new DaemonClient({
+test("timeline observation consumes broadcasts from a host without selective delivery", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
     url: "ws://test",
     clientId: "timeline_legacy",
-    transportFactory: () => legacyTransport.transport,
+    transportFactory: () => mock.transport,
     reconnect: { enabled: false },
   });
-  clients.push(supportedClient, legacyClient);
-
-  const supportedConnect = supportedClient.connect();
-  supportedTransport.triggerOpen({ features: { selectiveAgentTimeline: true } });
-  await supportedConnect;
-  const legacyConnect = legacyClient.connect();
-  legacyTransport.triggerOpen();
-  await legacyConnect;
-
-  expect(supportedClient.getLastServerInfoMessage()?.features).toEqual({
-    selectiveAgentTimeline: true,
-  });
-
-  const setPromise = supportedClient.setAgentTimelineSubscription(["agent-b", "agent-a"]);
-  await Promise.resolve();
-  const request = parseSentFrame(supportedTransport.sent[0]);
-  supportedTransport.triggerMessage(
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: {} });
+  await connecting;
+  const observation = client.observeTimeline(["agent"]);
+  await expect(observation.ready).resolves.toMatchObject({ agentIds: ["agent"] });
+  const updates: unknown[] = [];
+  observation.subscribe({ snapshot: () => {}, update: (message) => updates.push(message) });
+  mock.triggerMessage(
     wrapSessionMessage({
-      type: "agent.timeline.set_subscription.response",
+      type: "agent_stream",
       payload: {
-        requestId: request.requestId,
-        agentIds: ["agent-a", "agent-b"],
+        agentId: "agent",
+        timestamp: "2026-09-11T00:00:00Z",
+        event: { type: "turn_completed", provider: "codex" },
       },
     }),
   );
-  await setPromise;
-  await legacyClient.setAgentTimelineSubscription(["agent-a"]);
-
-  expect({ request, legacyFrames: legacyTransport.sent }).toEqual({
-    request: {
-      type: "agent.timeline.set_subscription.request",
-      requestId: expect.any(String),
-      agentIds: ["agent-a", "agent-b"],
-    },
-    legacyFrames: [],
-  });
+  expect(updates).toEqual([expect.objectContaining({ type: "agent_stream" })]);
+  await observation.release();
+  expect(mock.sent).toEqual([]);
 });
 
 test("normalizes legacy and dedicated agent attention notifications", async () => {
@@ -450,7 +443,7 @@ class FakeDaemon {
       this.closeEvents.push({ code, reason });
     },
     onMessage: (handler) => {
-      this.onMessage = handler;
+      this.onMessage = (data) => handler(data, typeof data !== "string");
       return () => {};
     },
     onOpen: (handler) => {
@@ -737,12 +730,21 @@ test("advertises client capabilities in hello", async () => {
     clientType: "cli",
     protocolVersion: 1,
     capabilities: {
+      all_providers: true,
+      selective_agent_timeline: true,
+      timeline_replacement_invalidation: true,
+      provider_snapshot_references: true,
+      explicit_event_subscriptions: true,
+      owned_subscriptions: true,
       compact_provider_snapshots: true,
       custom_mode_icons: true,
       project_updates: true,
       provider_subagents: true,
       reasoning_merge_enum: true,
       terminal_reflowable_snapshot: true,
+      timeline_notifications: true,
+      plugin_timeline_items: true,
+      workspace_setup_blocked: true,
       browser_host: {
         supportedCommands: ["list_tabs"],
         hostKind: "desktop app",
@@ -771,7 +773,7 @@ test("allows callers to disable default client capabilities", async () => {
   const hello = z
     .object({
       type: z.literal("hello"),
-      capabilities: z.record(z.unknown()),
+      capabilities: z.record(z.string(), z.unknown()),
     })
     .parse(JSON.parse(assertStr(mock.sent[0])));
   expect(hello.capabilities[CLIENT_CAPS.projectUpdates]).toBe(false);
@@ -942,6 +944,87 @@ test("does not reconnect after close when ensureConnected is called", async () =
 
   client.ensureConnected();
   expect(client.getConnectionState().status).toBe("disposed");
+});
+
+test("ensureConnected reconnects immediately without leaving the scheduled retry armed", async () => {
+  useHeartbeatClock();
+  try {
+    const first = createMockTransport();
+    const second = createMockTransport();
+    const third = createMockTransport();
+    const transports = [first, second, third];
+    let transportIndex = 0;
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_immediate_reconnect",
+      reconnect: { enabled: true, baseDelayMs: 1_500, maxDelayMs: 1_500 },
+      transportFactory: () => {
+        const transport = transports[transportIndex];
+        if (!transport) throw new Error("unexpected extra reconnect");
+        transportIndex += 1;
+        return transport.transport;
+      },
+    });
+    clients.push(client);
+
+    const initialConnect = client.connect();
+    first.triggerOpen();
+    await initialConnect;
+    first.triggerClose({ code: 1001, reason: "app resumed" });
+    expect(client.getConnectionState().status).toBe("disconnected");
+
+    client.ensureConnected();
+    expect(client.getConnectionState().status).toBe("connecting");
+    expect(transportIndex).toBe(2);
+
+    second.triggerOpen();
+    expect(client.getConnectionState().status).toBe("connected");
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(client.getConnectionState().status).toBe("connected");
+    expect(transportIndex).toBe(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("disabling reconnect cancels a pending retry until explicitly resumed", async () => {
+  useHeartbeatClock();
+  try {
+    const first = createMockTransport();
+    const second = createMockTransport();
+    const transports = [first, second];
+    let transportIndex = 0;
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_paused_reconnect",
+      reconnect: { enabled: true, baseDelayMs: 1_500, maxDelayMs: 1_500 },
+      transportFactory: () => {
+        const transport = transports[transportIndex];
+        if (!transport) throw new Error("unexpected extra reconnect");
+        transportIndex += 1;
+        return transport.transport;
+      },
+    });
+    clients.push(client);
+
+    const initialConnect = client.connect();
+    first.triggerOpen();
+    await initialConnect;
+    first.triggerClose({ code: 1001, reason: "app backgrounded" });
+
+    client.setReconnectEnabled(false);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(client.getConnectionState().status).toBe("disconnected");
+    expect(transportIndex).toBe(1);
+
+    client.setReconnectEnabled(true);
+    client.ensureConnected();
+    expect(client.getConnectionState().status).toBe("connecting");
+    expect(transportIndex).toBe(2);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("keeps the transport connected when a session RPC ping times out", async () => {
@@ -1362,7 +1445,7 @@ test("honors explicit getDaemonStatus timeout below the session RPC default", as
   clients.push(client);
 
   const connectPromise = client.connect();
-  mock.triggerOpen();
+  mock.triggerOpen({ features: { daemonStatusRpc: true } });
   await connectPromise;
 
   const responsePromise = client.getDaemonStatus({
@@ -1988,6 +2071,49 @@ test("file context action RPCs correlate success and error responses", async () 
   });
 });
 
+test("serializes plugin source suffixes through the legacy path field", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_plugin_source",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const installPromise = client.installPluginSource({
+    source: "owner/repository:plugins/review",
+  });
+  const request = parseSentFrame(mock.sent.at(-1));
+  expect(request).toEqual({
+    type: "plugin.source.install.request",
+    requestId: expect.any(String),
+    source: "owner/repository",
+    pluginPath: "plugins/review",
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "plugin.source.install.response",
+      payload: {
+        requestId: request.requestId,
+        plugin: {
+          id: "review",
+          path: "/plugins/review",
+          enabled: true,
+          status: "running",
+        },
+      },
+    }),
+  );
+
+  await expect(installPromise).resolves.toMatchObject({ id: "review", status: "running" });
+});
+
 test("a connection loss rejects an in-flight file context action", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({
@@ -2212,6 +2338,61 @@ test("readFile resolves from binary file frames when the daemon supports them", 
   expect(new TextDecoder().decode(result.bytes)).toBe("hello");
 });
 
+test("readFile drops an old daemon's over-budget binary chunks and reports the refusal", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_file_budget_compat",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const responsePromise = client.readFile("/tmp/project", "large.txt", "req-budget", 10);
+  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
+    type: "session",
+    message: {
+      type: "file_explorer_request",
+      cwd: "/tmp/project",
+      path: "large.txt",
+      mode: "file",
+      acceptBinary: true,
+      maxBytes: 10,
+      requestId: "req-budget",
+    },
+  });
+
+  mock.triggerMessage(
+    encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileBegin,
+      requestId: "req-budget",
+      metadata: {
+        mime: "text/plain",
+        size: 100,
+        encoding: "utf-8",
+        modifiedAt: "2026-05-02T00:00:00.000Z",
+      },
+    }),
+  );
+  mock.triggerMessage(
+    encodeFileTransferFrame({
+      opcode: FileTransferOpcode.FileChunk,
+      requestId: "req-budget",
+      payload: new Uint8Array(100),
+    }),
+  );
+  mock.triggerMessage(
+    encodeFileTransferFrame({ opcode: FileTransferOpcode.FileEnd, requestId: "req-budget" }),
+  );
+
+  await expect(responsePromise).rejects.toThrow("File is too large to display");
+});
+
 test("uploadFile sends metadata request and file bytes as binary chunks", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();
@@ -2406,10 +2587,11 @@ test("sends create_agent_request with workspace and caller identity", async () =
   clients.push(client);
 
   const connectPromise = client.connect();
-  mock.triggerOpen();
+  mock.triggerOpen({ features: { agentRequestReceipts: true } });
   await connectPromise;
 
   const createPromise = client.createAgent({
+    idempotencyKey: "one-creation",
     provider: "codex",
     cwd: "/tmp/project/.paseo/worktrees/feature-a",
     workspaceId: "ws-feature-a",
@@ -2423,6 +2605,7 @@ test("sends create_agent_request with workspace and caller identity", async () =
   expect(request).toEqual(
     expect.objectContaining({
       type: "create_agent_request",
+      idempotencyKey: "one-creation",
       workspaceId: "ws-feature-a",
       callerAgentId: "parent-agent",
     }),
@@ -2796,6 +2979,45 @@ test("sends project.add.request without creating a workspace", async () => {
     },
     error: null,
   });
+});
+
+test("marks a workspace unread through the dotted RPC", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const markPromise = client.markWorkspaceUnread("workspace-1", "req-mark-unread");
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "workspace.mark_unread.request",
+    workspaceId: "workspace-1",
+    requestId: "req-mark-unread",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "workspace.mark_unread.response",
+      payload: {
+        requestId: "req-mark-unread",
+        workspaceId: "workspace-1",
+        markedAgentId: "agent-1",
+        success: true,
+        error: null,
+      },
+    }),
+  );
+
+  await expect(markPromise).resolves.toBeUndefined();
 });
 
 test("searches GitHub repositories through the dotted RPC", async () => {
@@ -3396,16 +3618,14 @@ test("subscribes to checkout diff updates via RPC handshake", async () => {
   mock.triggerOpen();
   await connectPromise;
 
-  const promise = client.subscribeCheckoutDiff(
-    "/tmp/project",
-    { mode: "uncommitted" },
-    { subscriptionId: "checkout-sub-1" },
-  );
+  const subscription = client.observeCheckoutDiff("/tmp/project", { mode: "uncommitted" });
+  const promise = subscription.ready;
+  await vi.waitFor(() => expect(mock.sent).toHaveLength(1));
 
   expect(mock.sent).toHaveLength(1);
   const request = parseSentFrame(mock.sent[0]);
   expect(request.type).toBe("subscribe_checkout_diff_request");
-  expect(request.subscriptionId).toBe("checkout-sub-1");
+  expect(request.subscriptionId).toBeUndefined();
   expect(request.cwd).toBe("/tmp/project");
   expect(request.compare).toEqual({ mode: "uncommitted" });
 
@@ -3434,7 +3654,7 @@ test("subscribes to checkout diff updates via RPC handshake", async () => {
   });
 });
 
-test("getCheckoutDiff uses one-shot subscription protocol", async () => {
+test("getCheckoutDiff reads a snapshot without creating a subscription", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();
 
@@ -3455,7 +3675,7 @@ test("getCheckoutDiff uses one-shot subscription protocol", async () => {
 
   expect(mock.sent).toHaveLength(1);
   const subscribeRequest = parseSentFrame(mock.sent[0]);
-  expect(subscribeRequest.type).toBe("subscribe_checkout_diff_request");
+  expect(subscribeRequest.type).toBe("checkout.diff.get.request");
   expect(subscribeRequest.cwd).toBe("/tmp/project");
   expect(subscribeRequest.compare).toEqual({
     mode: "base",
@@ -3466,9 +3686,8 @@ test("getCheckoutDiff uses one-shot subscription protocol", async () => {
     JSON.stringify({
       type: "session",
       message: {
-        type: "subscribe_checkout_diff_response",
+        type: "checkout.diff.get.response",
         payload: {
-          subscriptionId: subscribeRequest.subscriptionId,
           cwd: "/tmp/project",
           files: [],
           error: null,
@@ -3485,10 +3704,7 @@ test("getCheckoutDiff uses one-shot subscription protocol", async () => {
     requestId: subscribeRequest.requestId,
   });
 
-  expect(mock.sent).toHaveLength(2);
-  const unsubscribeRequest = parseSentFrame(mock.sent[1]);
-  expect(unsubscribeRequest.type).toBe("unsubscribe_checkout_diff_request");
-  expect(unsubscribeRequest.subscriptionId).toBe(subscribeRequest.subscriptionId);
+  expect(mock.sent).toHaveLength(1);
 });
 
 test("requests branch suggestions via RPC", async () => {
@@ -4033,7 +4249,7 @@ test("renames a branch via RPC", async () => {
   });
 
   expect(mock.sent).toHaveLength(1);
-  const request = JSON.parse(mock.sent[0]) as {
+  const request = JSON.parse(assertStr(mock.sent[0])) as {
     type: "session";
     message: {
       type: "checkout.rename_branch.request";
@@ -4135,29 +4351,52 @@ test("resubscribes checkout diff streams after reconnect", async () => {
   });
   clients.push(client);
 
-  const internal = client as unknown as {
-    checkoutDiffSubscriptions: Map<
-      string,
-      { cwd: string; compare: { mode: "uncommitted" | "base"; baseRef?: string } }
-    >;
-  };
-  internal.checkoutDiffSubscriptions.set("checkout-sub-1", {
-    cwd: "/tmp/project",
-    compare: { mode: "base", baseRef: "main" },
-  });
-
   const connectPromise = client.connect();
   mock.triggerOpen();
   await connectPromise;
 
-  expect(mock.sent).toHaveLength(1);
+  const observation = client.observeCheckoutDiff("/tmp/project", { mode: "base", baseRef: "main" });
+  await vi.waitFor(() => expect(mock.sent).toHaveLength(1));
+  const first = parseSentFrame(mock.sent[0]);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "subscribe_checkout_diff_response",
+      payload: {
+        requestId: first.requestId,
+        subscriptionId: "server-first",
+        cwd: "/tmp/project",
+        files: [],
+        error: null,
+      },
+    }),
+  );
+  await observation.ready;
+  mock.triggerClose();
+  const reconnect = client.connect();
+  mock.triggerOpen();
+  await reconnect;
+  await vi.waitFor(() => expect(mock.sent).toHaveLength(1));
   const request = parseSentFrame(mock.sent[0]);
-  expect(request.type).toBe("subscribe_checkout_diff_request");
-  expect(request.subscriptionId).toBe("checkout-sub-1");
-  expect(request.cwd).toBe("/tmp/project");
-  expect(request.compare).toEqual({ mode: "base", baseRef: "main" });
-  expect(typeof request.requestId).toBe("string");
-  expect(z.string().parse(request.requestId).length).toBeGreaterThan(0);
+  expect(request).toMatchObject({
+    type: "subscribe_checkout_diff_request",
+    cwd: "/tmp/project",
+    compare: { mode: "base", baseRef: "main" },
+  });
+  expect(request.subscriptionId).toBeUndefined();
+  expect(request.requestId).not.toBe(first.requestId);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "subscribe_checkout_diff_response",
+      payload: {
+        requestId: request.requestId,
+        subscriptionId: "server-second",
+        cwd: "/tmp/project",
+        files: [],
+        error: null,
+      },
+    }),
+  );
+  await vi.waitFor(() => expect(observation.subscriptionId).toBe("server-second"));
 });
 
 test("fetches agents via RPC with filters, sort, and pagination", async () => {
@@ -4184,10 +4423,10 @@ test("fetches agents via RPC with filters, sort, and pagination", async () => {
       { key: "created_at", direction: "desc" },
     ],
     page: { limit: 25, cursor: "cursor-1" },
-    subscribe: { subscriptionId: "sub-1" },
+    subscribe: {},
   });
 
-  expect(mock.sent).toHaveLength(1);
+  await vi.waitFor(() => expect(mock.sent).toHaveLength(1));
   const request = parseSentFrame(mock.sent[0]);
   expect(request.type).toBe("fetch_agents_request");
   expect(request.sort).toEqual([
@@ -4195,7 +4434,7 @@ test("fetches agents via RPC with filters, sort, and pagination", async () => {
     { key: "created_at", direction: "desc" },
   ]);
   expect(request.page).toEqual({ limit: 25, cursor: "cursor-1" });
-  expect(request.subscribe).toEqual({ subscriptionId: "sub-1" });
+  expect(request.subscribe).toEqual({});
 
   mock.triggerMessage(
     JSON.stringify({
@@ -4219,6 +4458,10 @@ test("fetches agents via RPC with filters, sort, and pagination", async () => {
   await expect(promise).resolves.toEqual({
     requestId: request.requestId,
     subscriptionId: "sub-1",
+    subscription: expect.objectContaining({
+      subscriptionId: "sub-1",
+      release: expect.any(Function),
+    }),
     entries: [],
     pageInfo: {
       nextCursor: null,
@@ -4401,6 +4644,7 @@ test("fetches scoped recent provider sessions", async () => {
     providers: ["my-claude"],
     since: "2026-04-30T00:00:00.000Z",
     limit: 25,
+    query: "invoice",
   });
 
   expect(mock.sent).toHaveLength(1);
@@ -4413,6 +4657,7 @@ test("fetches scoped recent provider sessions", async () => {
       providers?: string[];
       since?: string;
       limit?: number;
+      query?: string;
     };
   };
   expect(request.message).toMatchObject({
@@ -4421,6 +4666,7 @@ test("fetches scoped recent provider sessions", async () => {
     providers: ["my-claude"],
     since: "2026-04-30T00:00:00.000Z",
     limit: 25,
+    query: "invoice",
   });
 
   mock.triggerMessage(
@@ -5061,11 +5307,15 @@ test("emits output events for the active terminal stream", async () => {
     seen.push(new TextDecoder().decode(event.data));
   });
 
-  const subscribePromise = client.subscribeTerminal("term-1", "sub-1");
+  const subscribePromise = client.subscribeTerminal("term-1", { requestId: "sub-1" });
+  await vi.waitFor(() =>
+    expect(parseSentFrame(mock.sent.at(-1)).type).toBe("subscribe_terminal_request"),
+  );
   mock.triggerMessage(
     wrapSessionMessage({
       type: "subscribe_terminal_response",
       payload: {
+        subscriptionId: "server-" + String(parseSentFrame(mock.sent.at(-1)).requestId),
         terminalId: "term-1",
         slot: 11,
         error: null,
@@ -5113,11 +5363,15 @@ test("emits snapshot events for the subscribed terminal stream", async () => {
     snapshots.push(event.state);
   });
 
-  const subscribePromise = client.subscribeTerminal("term-1", "sub-2");
+  const subscribePromise = client.subscribeTerminal("term-1", { requestId: "sub-2" });
+  await vi.waitFor(() =>
+    expect(parseSentFrame(mock.sent.at(-1)).type).toBe("subscribe_terminal_request"),
+  );
   mock.triggerMessage(
     wrapSessionMessage({
       type: "subscribe_terminal_response",
       payload: {
+        subscriptionId: "server-" + String(parseSentFrame(mock.sent.at(-1)).requestId),
         terminalId: "term-1",
         slot: 12,
         error: null,
@@ -5145,7 +5399,7 @@ test("emits snapshot events for the subscribed terminal stream", async () => {
   expect(snapshots).toEqual([state]);
 });
 
-test("sends input and resize frames for the subscribed terminal slot", async () => {
+test("sends explicit terminal input and resize commands", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();
 
@@ -5162,11 +5416,15 @@ test("sends input and resize frames for the subscribed terminal slot", async () 
   mock.triggerOpen();
   await connectPromise;
 
-  const subscribePromise = client.subscribeTerminal("term-1", "sub-3");
+  const subscribePromise = client.subscribeTerminal("term-1", { requestId: "sub-3" });
+  await vi.waitFor(() =>
+    expect(parseSentFrame(mock.sent.at(-1)).type).toBe("subscribe_terminal_request"),
+  );
   mock.triggerMessage(
     wrapSessionMessage({
       type: "subscribe_terminal_response",
       payload: {
+        subscriptionId: "server-" + String(parseSentFrame(mock.sent.at(-1)).requestId),
         terminalId: "term-1",
         slot: 13,
         error: null,
@@ -5188,19 +5446,18 @@ test("sends input and resize frames for the subscribed terminal slot", async () 
     intent: "update",
   });
 
-  const inputFrame = decodeTerminalStreamFrame(asUint8Array(mock.sent[0])!);
-  const resizeFrame = decodeTerminalStreamFrame(asUint8Array(mock.sent[1])!);
-
-  expect(inputFrame?.opcode).toBe(TerminalStreamOpcode.Input);
-  expect(inputFrame?.slot).toBe(13);
-  expect(new TextDecoder().decode(inputFrame?.payload ?? new Uint8Array())).toBe("echo hello\r");
-  expect(resizeFrame?.opcode).toBe(TerminalStreamOpcode.Resize);
-  expect(resizeFrame?.slot).toBe(13);
-  expect(decodeTerminalResizePayload(resizeFrame?.payload ?? new Uint8Array())).toEqual({
-    rows: 24,
-    cols: 80,
-    intent: "update",
-  });
+  expect(mock.sent.map(parseSentFrame)).toEqual([
+    {
+      type: "terminal_input",
+      terminalId: "term-1",
+      message: { type: "input", data: "echo hello\r" },
+    },
+    {
+      type: "terminal_input",
+      terminalId: "term-1",
+      message: { type: "resize", rows: 24, cols: 80, intent: "update" },
+    },
+  ]);
 });
 
 test("routes concurrent terminal stream frames by slot", async () => {
@@ -5228,11 +5485,15 @@ test("routes concurrent terminal stream frames by slot", async () => {
     seen.push(`${event.terminalId}:${new TextDecoder().decode(event.data)}`);
   });
 
-  const subscribeFirstPromise = client.subscribeTerminal("term-1", "sub-multi-1");
+  const subscribeFirstPromise = client.subscribeTerminal("term-1", { requestId: "sub-multi-1" });
+  await vi.waitFor(() =>
+    expect(parseSentFrame(mock.sent.at(-1)).type).toBe("subscribe_terminal_request"),
+  );
   mock.triggerMessage(
     wrapSessionMessage({
       type: "subscribe_terminal_response",
       payload: {
+        subscriptionId: "server-" + String(parseSentFrame(mock.sent.at(-1)).requestId),
         terminalId: "term-1",
         slot: 21,
         error: null,
@@ -5242,11 +5503,15 @@ test("routes concurrent terminal stream frames by slot", async () => {
   );
   await subscribeFirstPromise;
 
-  const subscribeSecondPromise = client.subscribeTerminal("term-2", "sub-multi-2");
+  const subscribeSecondPromise = client.subscribeTerminal("term-2", { requestId: "sub-multi-2" });
+  await vi.waitFor(() =>
+    expect(parseSentFrame(mock.sent.at(-1)).type).toBe("subscribe_terminal_request"),
+  );
   mock.triggerMessage(
     wrapSessionMessage({
       type: "subscribe_terminal_response",
       payload: {
+        subscriptionId: "server-" + String(parseSentFrame(mock.sent.at(-1)).requestId),
         terminalId: "term-2",
         slot: 22,
         error: null,
@@ -5282,14 +5547,19 @@ test("routes concurrent terminal stream frames by slot", async () => {
     cols: 20,
   });
 
-  const inputFrame = decodeTerminalStreamFrame(asUint8Array(mock.sent[0])!);
-  const resizeFrame = decodeTerminalStreamFrame(asUint8Array(mock.sent[1])!);
-
   expect(seen).toEqual(["term-2:beta", "term-1:alpha"]);
-  expect(inputFrame?.opcode).toBe(TerminalStreamOpcode.Input);
-  expect(inputFrame?.slot).toBe(22);
-  expect(resizeFrame?.opcode).toBe(TerminalStreamOpcode.Resize);
-  expect(resizeFrame?.slot).toBe(21);
+  expect(mock.sent.map(parseSentFrame)).toEqual([
+    {
+      type: "terminal_input",
+      terminalId: "term-2",
+      message: { type: "input", data: "echo beta\r" },
+    },
+    {
+      type: "terminal_input",
+      terminalId: "term-1",
+      message: { type: "resize", rows: 10, cols: 20 },
+    },
+  ]);
 });
 
 test("ignores terminal stream frames after terminal_stream_exit", async () => {
@@ -5317,11 +5587,15 @@ test("ignores terminal stream frames after terminal_stream_exit", async () => {
     seen.push(new TextDecoder().decode(event.data));
   });
 
-  const subscribePromise = client.subscribeTerminal("term-1", "sub-4");
+  const subscribePromise = client.subscribeTerminal("term-1", { requestId: "sub-4" });
+  await vi.waitFor(() =>
+    expect(parseSentFrame(mock.sent.at(-1)).type).toBe("subscribe_terminal_request"),
+  );
   mock.triggerMessage(
     wrapSessionMessage({
       type: "subscribe_terminal_response",
       payload: {
+        subscriptionId: "server-" + String(parseSentFrame(mock.sent.at(-1)).requestId),
         terminalId: "term-1",
         slot: 14,
         error: null,
@@ -5344,6 +5618,7 @@ test("ignores terminal stream frames after terminal_stream_exit", async () => {
     wrapSessionMessage({
       type: "terminal_stream_exit",
       payload: {
+        subscriptionId: "server-sub-4",
         terminalId: "term-1",
       },
     }),
@@ -5358,6 +5633,21 @@ test("ignores terminal stream frames after terminal_stream_exit", async () => {
   );
 
   expect(seen).toEqual(["before-exit"]);
+  await vi.waitFor(() =>
+    expect(parseSentFrame(mock.sent.at(-1)).type).toBe("subscription.release.request"),
+  );
+  const release = parseSentFrame(mock.sent.at(-1));
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "subscription.release.response",
+      payload: {
+        requestId: release.requestId,
+        subscriptionId: "server-sub-4",
+        released: true,
+      },
+    }),
+  );
+  await Promise.resolve();
   unsubscribe();
 });
 
@@ -5703,24 +5993,41 @@ test("sends subscribe/unsubscribe terminals messages", async () => {
   mock.triggerOpen();
   await connectPromise;
 
-  client.subscribeTerminals({ cwd: "/tmp/project" });
-  client.unsubscribeTerminals({ cwd: "/tmp/project" });
-
-  expect(mock.sent).toHaveLength(2);
-  expect(JSON.parse(assertStr(mock.sent[0]))).toEqual({
-    type: "session",
-    message: {
-      type: "subscribe_terminals_request",
-      cwd: "/tmp/project",
-    },
+  const observation = client.observeTerminals({ cwd: "/tmp/project" });
+  await vi.waitFor(() => expect(mock.sent).toHaveLength(1));
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toMatchObject({ type: "subscribe_terminals_request", cwd: "/tmp/project" });
+  expect(request.subscriptionId).toBeUndefined();
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "terminals_changed",
+      payload: {
+        requestId: request.requestId,
+        subscriptionId: "server-terminals",
+        cwd: "/tmp/project",
+        terminals: [],
+      },
+    }),
+  );
+  await observation.ready;
+  const release = observation.release();
+  await vi.waitFor(() => expect(mock.sent).toHaveLength(2));
+  const requestRelease = parseSentFrame(mock.sent[1]);
+  expect(requestRelease).toMatchObject({
+    type: "subscription.release.request",
+    subscriptionId: "server-terminals",
   });
-  expect(JSON.parse(assertStr(mock.sent[1]))).toEqual({
-    type: "session",
-    message: {
-      type: "unsubscribe_terminals_request",
-      cwd: "/tmp/project",
-    },
-  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "subscription.release.response",
+      payload: {
+        requestId: requestRelease.requestId,
+        subscriptionId: "server-terminals",
+        released: true,
+      },
+    }),
+  );
+  await release;
 });
 
 test("dispatches terminals_changed events to typed listeners", async () => {
@@ -5965,4 +6272,53 @@ test("waitForFinish with timeout=0 omits timeoutMs and has no client deadline", 
   } finally {
     vi.useRealTimers();
   }
+});
+
+test("wire snapshot callers own expansion and receive hash references unchanged", async () => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "wire-catalog",
+    providerSnapshots: "wire",
+    reconnect: { enabled: false },
+    transportFactory: () => transport.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  transport.triggerOpen({ preserveSent: true });
+  await connected;
+  expect(JSON.parse(assertStr(transport.sent[0])).capabilities.provider_snapshot_references).toBe(
+    true,
+  );
+  const received: unknown[] = [];
+  client.on("providers_snapshot_update", (message) => received.push(message.payload));
+  const payload = {
+    entries: [],
+    snapshotHash: "content",
+    fetchedAt: { codex: "2026-09-06T12:00:00.000Z" },
+    generatedAt: "2026-09-06T12:00:00.000Z",
+  };
+  transport.triggerMessage(wrapSessionMessage({ type: "providers_snapshot_update", payload }));
+  expect(received).toEqual([payload]);
+  const request = client.getProvidersSnapshot();
+  const sent = parseSentFrame(transport.sent.at(-1)!);
+  const body = {
+    ...payload,
+    compactSnapshot: {
+      entries: [
+        {
+          provider: "codex",
+          enabled: true,
+          status: "ready",
+          models: [{ id: "astra", label: "Astra" }],
+        },
+      ],
+      thinkingSets: [],
+    },
+    requestId: sent.requestId,
+  };
+  transport.triggerMessage(
+    wrapSessionMessage({ type: "get_providers_snapshot_response", payload: body }),
+  );
+  expect(await request).toEqual(body);
 });

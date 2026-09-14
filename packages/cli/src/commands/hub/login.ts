@@ -1,3 +1,5 @@
+import type { CommandOptions } from "../../output/index.js";
+import type { DaemonTarget } from "../../utils/daemon-target.js";
 import type { Command } from "commander";
 import { withOutput, type OutputSchema, type SingleResult } from "../../output/index.js";
 import { addJsonOption } from "../../utils/command-options.js";
@@ -26,12 +28,12 @@ interface HubLoginDependencies {
   flow: Pick<CliLoginFlow, "authorize">;
   reporter: HubReporter;
   isInteractive?(): boolean;
-  continueGuidedSetup?(origin: string): Promise<void>;
+  continueGuidedSetup?(origin: string, daemonTarget: DaemonTarget): Promise<void>;
 }
 
 export async function runHubLogin(
   originInput: string | undefined,
-  options: { json?: boolean },
+  options: Pick<CommandOptions, "json" | "daemonTarget">,
   dependencies: HubLoginDependencies,
 ): Promise<SingleResult<HubLoginResult>> {
   const origin = resolveHubOrigin({
@@ -42,12 +44,13 @@ export async function runHubLogin(
   reportHubProgress(dependencies.reporter, options, `Logging in to ${origin}`);
   const credential = await dependencies.flow.authorize(origin);
   dependencies.credentials.save({ origin, credential });
+  reportHubProgress(dependencies.reporter, options, "Logged in");
   if (
     !options.json &&
     dependencies.isInteractive?.() &&
     dependencies.continueGuidedSetup !== undefined
   ) {
-    await dependencies.continueGuidedSetup(origin);
+    await dependencies.continueGuidedSetup(origin, options.daemonTarget);
   }
   return { type: "single", data: { origin, status: "logged_in" }, schema };
 }
@@ -63,7 +66,7 @@ export function addHubLoginCommand(parent: Command, dependencies: HubLoginDepend
   ).action(
     withOutput(async (...args) => {
       const origin = args[0] as string | undefined;
-      const options = args.at(-2) as { json?: boolean };
+      const options = args.at(-2) as CommandOptions;
       return runHubLogin(origin, options, dependencies);
     }),
   );

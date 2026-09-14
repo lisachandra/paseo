@@ -1,3 +1,4 @@
+import { subscriptionFixture } from "@/runtime/subscription-fixture";
 /**
  * @vitest-environment jsdom
  */
@@ -58,6 +59,11 @@ vi.mock("@/components/adaptive-modal-sheet", async () => {
 
 vi.mock("react-native-reanimated", () => ({
   default: { View: "div" },
+  Keyframe: class {
+    duration() {
+      return this;
+    }
+  },
   Easing: { ease: "ease", inOut: (value: unknown) => value },
   interpolateColor: (value: number, _input: number[], output: string[]) =>
     value >= 1 ? output[1] : output[0],
@@ -98,7 +104,11 @@ function plugin(enabled = true): PluginListItem {
 
 function createClient() {
   return {
-    on: vi.fn(() => () => undefined),
+    observeEvents: () =>
+      subscriptionFixture(
+        Promise.resolve({ events: ["status.plugin_catalog_changed"] }),
+        () => () => {},
+      ),
     getDaemonConfig: vi.fn(async () => ({ config: { pluginsEnabled: true } })),
     patchDaemonConfig: vi.fn(async () => ({ config: { pluginsEnabled: true } })),
     listPlugins: vi.fn(async (): Promise<PluginListItem[]> => []),
