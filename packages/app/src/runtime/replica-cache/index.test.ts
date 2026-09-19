@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 import {
   normalizeProjectDescriptor,
@@ -7,7 +7,7 @@ import {
 } from "@/stores/session-store";
 import type { StreamItem } from "@/types/stream";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
-import { ReplicaCache } from ".";
+import { MAX_READ_ATTEMPTS, ReplicaCache } from ".";
 import type { DirectoryCheckpoint } from "@/runtime/replica-cache";
 import type { ReplicaHostRows, ReplicaRow, ReplicaRowChanges, ReplicaRowStore } from "./row-store";
 
@@ -32,6 +32,7 @@ class MemoryStorage implements ReplicaRowStore {
   writes = 0;
   cleanups = 0;
   nextWriteFailure: Error | null = null;
+  writeFailure: Error | null = null;
   readGate: Promise<void> | null = null;
   onRead: (() => void) | null = null;
 
@@ -76,6 +77,7 @@ class MemoryStorage implements ReplicaRowStore {
       this.nextWriteFailure = null;
       throw error;
     }
+    if (this.writeFailure) throw this.writeFailure;
     this.changes.push(changes);
     for (const key of changes.deletes) this.rows.delete(this.key(key));
     for (const row of changes.upserts) this.rows.set(this.key(row), row);
@@ -764,5 +766,25 @@ describe("ReplicaCache", () => {
     await cache.flush();
 
     expect(storage.cleanups).toBe(1);
+  });
+
+  it("serves an empty read instead of looping forever when writes keep failing", async () => {
+    const storage = new MemoryStorage();
+    const cache = createCache(storage);
+    storage.writeFailure = new Error("disk busy");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      cache.commitTimeline(SERVER_ID, "agent-1", timeline("Never persisted"));
+
+      expect(await cache.readTimeline(SERVER_ID, "agent-1")).toBeUndefined();
+      expect(storage.reads.length).toBe(MAX_READ_ATTEMPTS);
+      expect(storage.writes).toBeGreaterThan(0);
+      expect(warn.mock.calls.map(([message]) => String(message))).toContainEqual(
+        expect.stringContaining("writes stayed pending"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

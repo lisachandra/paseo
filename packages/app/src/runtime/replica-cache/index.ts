@@ -71,6 +71,10 @@ export interface CachedTimeline {
 const PERSIST_DELAY_MS = 1_000;
 const MAX_TIMELINE_ITEMS = 50;
 const MAX_CACHE_BYTES = 32 * 1024 * 1024;
+// A read retries while a concurrent write advances the host revision. A writable
+// store settles after one or two attempts; a store whose pending writes keep
+// failing must not trap every read in a retry loop that never returns.
+export const MAX_READ_ATTEMPTS = 5;
 const IsoDateSchema = z.iso.datetime();
 const TimelinePositionSchema = z.strictObject({
   epoch: z.string(),
@@ -878,6 +882,7 @@ export class ReplicaCache {
   private pendingDeletes = new Map<string, ReplicaRowKey>();
   private pendingBaselines = new Set<string>();
   private readonly invalidatedHosts = new Set<string>();
+  private readonly reportedStoreFailures = new Set<string>();
   private readonly maxBytes: number;
   private totalBytes = 0;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -987,14 +992,19 @@ export class ReplicaCache {
     if (!this.activeServerIds.has(serverId)) return [];
     try {
       await this.prepareStore();
-      while (this.activeServerIds.has(serverId)) {
+      for (let attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt += 1) {
+        if (!this.activeServerIds.has(serverId)) return [];
         await this.flush();
         const revision = this.hostRevisions.get(serverId) ?? 0;
         const rows = await this.rowStore.read(serverId, kinds, ids);
         if (this.canReadHostRevision(serverId, revision)) return rows;
       }
+      this.reportStoreFailure(
+        `Replica cache served host ${serverId} from an empty cache: writes stayed pending after ${MAX_READ_ATTEMPTS} reads`,
+      );
       return [];
-    } catch {
+    } catch (error) {
+      this.reportStoreFailure(`Replica cache could not read rows for host ${serverId}`, error);
       return [];
     }
   }
@@ -1208,8 +1218,12 @@ export class ReplicaCache {
           for (const serverId of pending.baselines) {
             if (!evicted.has(serverId)) this.invalidatedHosts.delete(serverId);
           }
-        } catch {
+        } catch (error) {
           this.restorePendingChanges(pending);
+          this.reportStoreFailure(
+            `Replica cache could not persist rows for host ${this.describePendingServers(pending)}`,
+            error,
+          );
           if (this.hasPendingChanges()) this.schedulePersist();
         }
         return undefined;
@@ -1238,6 +1252,19 @@ export class ReplicaCache {
     return (
       this.pendingUpserts.size > 0 || this.pendingDeletes.size > 0 || this.pendingBaselines.size > 0
     );
+  }
+
+  private reportStoreFailure(message: string, detail?: unknown): void {
+    if (this.reportedStoreFailures.has(message)) return;
+    this.reportedStoreFailures.add(message);
+    console.warn(detail === undefined ? message : `${message}:`, detail);
+  }
+
+  private describePendingServers(pending: PendingReplicaChanges): string {
+    const serverIds = new Set<string>(pending.baselines);
+    for (const row of pending.upserts) serverIds.add(row.serverId);
+    for (const key of pending.deletes) serverIds.add(key.serverId);
+    return [...serverIds].sort().join(", ");
   }
 
   private canReadHostRevision(serverId: string, revision: number): boolean {
