@@ -39,6 +39,28 @@ describe("server config", () => {
 
     expect(config.providerCatalogRefreshTimeoutMs).toBe(180_000);
   });
+  test("keeps idle agents resident until config or env opts into eviction", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-idle-eviction-"));
+    roots.push(paseoHome);
+
+    expect(loadConfig(paseoHome, { env: {} }).idleAgentEvictionMs).toBeUndefined();
+    expect(
+      loadConfig(paseoHome, { env: { PASEO_IDLE_AGENT_EVICTION_MINUTES: "30" } })
+        .idleAgentEvictionMs,
+    ).toBe(30 * 60_000);
+
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({ agents: { idleAgentEvictionMinutes: 45 } }),
+    );
+    expect(loadConfig(paseoHome, { env: {} }).idleAgentEvictionMs).toBe(45 * 60_000);
+
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({ agents: { idleAgentEvictionMinutes: 0 } }),
+    );
+    expect(loadConfig(paseoHome, { env: {} }).idleAgentEvictionMs).toBeUndefined();
+  });
 
   test("resolves reload state from the supplied validated snapshot", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-snapshot-"));

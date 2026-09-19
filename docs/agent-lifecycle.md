@@ -25,8 +25,14 @@ Reload releases the old runtime before resuming its durable session: an idle pro
 still own an exclusive writer. A close failure retains that runtime for cleanup and blocks the
 replacement. Once closure succeeds, a failed resume leaves the durable agent closed and retryable.
 
-Idle agents remain resident indefinitely. Runtime closure happens only through an explicit lifecycle
-action such as archive, replacement, reload, workspace teardown, or daemon shutdown.
+Idle agents remain resident indefinitely by default. Runtime closure otherwise happens only
+through an explicit lifecycle action such as archive, replacement, reload, workspace teardown,
+or daemon shutdown. `agents.idleAgentEvictionMinutes` in `$PASEO_HOME/config.json` opts into
+releasing idle runtime (`PASEO_IDLE_AGENT_EVICTION_MINUTES` overrides it for non-managed
+launches, which are the only ones that keep daemon `PASEO_*` settings). The daemon then closes
+an agent that is `idle`, has no foreground turn, no in-flight run, no permission waiting on the
+user, no `paseo.open-agent-tab.*` label, and no activity inside the window. The record survives,
+and the next prompt or timeline request resumes it.
 
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and

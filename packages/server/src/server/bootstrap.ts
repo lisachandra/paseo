@@ -130,6 +130,7 @@ import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
+import { AgentIdleEvictor, toIdleEvictionAgent } from "./agent/agent-idle-evictor.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { FileAgentTimelineStore } from "./agent/file-agent-timeline-store.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
@@ -439,6 +440,7 @@ export interface PaseoDaemonConfig {
   downloadTokenTtlMs?: number;
   agentProviderSettings?: AgentProviderRuntimeSettingsMap;
   providerCatalogRefreshTimeoutMs?: number;
+  idleAgentEvictionMs?: number;
   metadataGeneration?: {
     providers?: Array<{
       provider: string;
@@ -951,6 +953,16 @@ export async function createPaseoDaemon(
   );
   await agentStorage.initialize();
   logger.info({ elapsed: elapsed() }, "Agent storage initialized");
+  const idleEvictor = new AgentIdleEvictor({
+    manager: {
+      listIdleEvictionAgents: () => agentManager.listAgents().map(toIdleEvictionAgent),
+      hasInFlightRun: (agentId) => agentManager.hasInFlightRun(agentId),
+      closeAgent: (agentId) => agentManager.closeAgent(agentId),
+    },
+    logger,
+    idleMs: config.idleAgentEvictionMs ?? 0,
+  });
+  idleEvictor.start();
   await bootstrapWorkspaceRegistries({
     serverId,
     paseoHome: config.paseoHome,
@@ -1779,6 +1791,7 @@ export async function createPaseoDaemon(
   };
 
   const stop = async () => {
+    idleEvictor.stop();
     await pluginRuntime.stopAllPlugins();
     unsubscribePluginProviders();
     await hubRelationships.stop();

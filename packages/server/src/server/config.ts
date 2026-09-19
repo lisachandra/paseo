@@ -189,6 +189,24 @@ function nonEmptyEnv(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+/**
+ * Opt-in runtime residency budget. Unset or 0 (the default) keeps idle agents resident forever; a
+ * positive value lets the daemon close an idle agent's provider process, which the next prompt or
+ * timeline request resumes through `ensureAgentLoaded()`. Managed daemons read
+ * `agents.idleAgentEvictionMinutes` from config.json because their launch strips the daemon's
+ * PASEO_* settings; standalone deployments can override it with
+ * `PASEO_IDLE_AGENT_EVICTION_MINUTES`.
+ */
+function resolveIdleAgentEvictionMs(
+  env: NodeJS.ProcessEnv,
+  persisted: PersistedConfig,
+): number | undefined {
+  const minutes =
+    parsePositiveIntegerEnv(env.PASEO_IDLE_AGENT_EVICTION_MINUTES) ??
+    persisted.agents?.idleAgentEvictionMinutes;
+  return minutes === undefined || minutes <= 0 ? undefined : minutes * 60_000;
+}
+
 function parsePositiveIntegerEnv(value: string | undefined): number | undefined {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
@@ -639,6 +657,7 @@ export function resolveConfigFromPersisted(
     voiceLlmModel: voiceLlm.model,
     agentProviderSettings: extractAgentProviderSettings(providerOverrides),
     providerCatalogRefreshTimeoutMs: persisted.agents?.catalogRefreshTimeoutMs,
+    idleAgentEvictionMs: resolveIdleAgentEvictionMs(env, persisted),
     metadataGeneration: persisted.agents?.metadataGeneration,
     providerOverrides,
     log: resolveLogConfigFromEnv(env, persisted),
