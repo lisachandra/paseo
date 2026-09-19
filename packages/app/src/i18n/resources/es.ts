@@ -679,6 +679,8 @@ export const es: TranslationResources = {
         archiveRunningAgentTitle: "¿Agente de ejecución de archivos?",
         archiveRunningAgentMessage:
           "Este agente todavía está ejecutándose. Archivarlo detendrá al agente y cerrará la pestaña.",
+        archiveAgentTitle: en.workspace.tabs.confirmations.archiveAgentTitle,
+        archiveAgentMessage: en.workspace.tabs.confirmations.archiveAgentMessage,
         closeTabsLeftTitle: "¿Cerrar pestañas a la izquierda?",
         closeTabsRightTitle: "¿Cerrar pestañas a la derecha?",
         closeOtherTabsTitle: "¿Cerrar otras pestañas?",

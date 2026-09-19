@@ -669,6 +669,8 @@ export const zhCN: TranslationResources = {
         closeTerminalMessage: "此 Terminal 中任何正在运行的进程都会立即停止。",
         archiveRunningAgentTitle: "归档正在运行的 Agent？",
         archiveRunningAgentMessage: "此 Agent 仍在运行。归档会停止该 Agent 并关闭标签。",
+        archiveAgentTitle: en.workspace.tabs.confirmations.archiveAgentTitle,
+        archiveAgentMessage: en.workspace.tabs.confirmations.archiveAgentMessage,
         closeTabsLeftTitle: "关闭左侧标签？",
         closeTabsRightTitle: "关闭右侧标签？",
         closeOtherTabsTitle: "关闭其他标签？",

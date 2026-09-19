@@ -676,6 +676,8 @@ export const ja: TranslationResources = {
         archiveRunningAgentTitle: "実行中のエージェントをアーカイブしますか？",
         archiveRunningAgentMessage:
           "このエージェントはまだ実行中です。アーカイブするとエージェントが停止してタブが閉じられます。",
+        archiveAgentTitle: en.workspace.tabs.confirmations.archiveAgentTitle,
+        archiveAgentMessage: en.workspace.tabs.confirmations.archiveAgentMessage,
         closeTabsLeftTitle: "左のタブを閉じますか？",
         closeTabsRightTitle: "右のタブを閉じますか？",
         closeOtherTabsTitle: "他のタブを閉じますか？",

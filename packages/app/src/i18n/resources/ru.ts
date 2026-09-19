@@ -679,6 +679,8 @@ export const ru: TranslationResources = {
         archiveRunningAgentTitle: "Архивировать работающего агента?",
         archiveRunningAgentMessage:
           "Этот агент всё ещё работает. При архивировании агент будет остановлен, а вкладка закрыта.",
+        archiveAgentTitle: en.workspace.tabs.confirmations.archiveAgentTitle,
+        archiveAgentMessage: en.workspace.tabs.confirmations.archiveAgentMessage,
         closeTabsLeftTitle: "Закрыть вкладки слева?",
         closeTabsRightTitle: "Закрыть вкладки справа?",
         closeOtherTabsTitle: "Закрыть другие вкладки?",

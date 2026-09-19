@@ -673,6 +673,8 @@ export const ko: TranslationResources = {
         archiveRunningAgentTitle: "실행 중인 에이전트를 보관할까요?",
         archiveRunningAgentMessage:
           "이 에이전트는 아직 실행 중입니다. 보관하면 에이전트가 중지되고 탭이 닫힙니다.",
+        archiveAgentTitle: en.workspace.tabs.confirmations.archiveAgentTitle,
+        archiveAgentMessage: en.workspace.tabs.confirmations.archiveAgentMessage,
         closeTabsLeftTitle: "왼쪽 탭을 닫을까요?",
         closeTabsRightTitle: "오른쪽 탭을 닫을까요?",
         closeOtherTabsTitle: "다른 탭을 닫을까요?",

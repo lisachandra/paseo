@@ -676,6 +676,8 @@ export const ptBR: TranslationResources = {
         archiveRunningAgentTitle: "Arquivar agente em execução?",
         archiveRunningAgentMessage:
           "Este agente ainda está em execução. Arquivá-lo interromperá o agente e fechará a aba.",
+        archiveAgentTitle: en.workspace.tabs.confirmations.archiveAgentTitle,
+        archiveAgentMessage: en.workspace.tabs.confirmations.archiveAgentMessage,
         closeTabsLeftTitle: "Fechar abas à esquerda?",
         closeTabsRightTitle: "Fechar abas à direita?",
         closeOtherTabsTitle: "Fechar outras abas?",

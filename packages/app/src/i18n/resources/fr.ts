@@ -679,6 +679,8 @@ export const fr: TranslationResources = {
         archiveRunningAgentTitle: "Archiver l'agent en cours d'exécution?",
         archiveRunningAgentMessage:
           "Cet agent est toujours en cours d'exécution. L'archiver arrêtera l'agent et fermera l'onglet.",
+        archiveAgentTitle: en.workspace.tabs.confirmations.archiveAgentTitle,
+        archiveAgentMessage: en.workspace.tabs.confirmations.archiveAgentMessage,
         closeTabsLeftTitle: "Fermer les onglets à gauche?",
         closeTabsRightTitle: "Fermer les onglets à droite?",
         closeOtherTabsTitle: "Fermer les autres onglets?",
