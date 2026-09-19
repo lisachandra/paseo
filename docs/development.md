@@ -23,6 +23,12 @@ Desktop dev launches its desktop-managed daemon with `PASEO_NODE_ENV=development
 so development-only providers such as Mock Load Test are available. Packaged
 desktop launches always force the daemon to production mode.
 
+Desktop dev runs its daemon from the checkout's compiled output,
+`packages/server/dist/scripts/supervisor-entrypoint.js`, not from `src`. Edits under
+`packages/server` or `packages/protocol` reach it only after `npm run build:server`, which
+`packages/desktop/scripts/dev-win.ps1` runs before launching Electron. Set
+`PASEO_SKIP_DEV_DAEMON_BUILD=1` to skip that rebuild when nothing server-side changed.
+
 The web and desktop dev launchers pass the current Git branch to Metro as
 `EXPO_PUBLIC_PASEO_DEV_BUILD_LABEL`. The expanded desktop sidebar shows it in
 the titlebar row. Production builds leave the variable unset and show no label.

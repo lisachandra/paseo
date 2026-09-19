@@ -44,6 +44,16 @@ if ($env:PASEO_HOME -eq "D:\Saves\User\.paseo" -or $env:PASEO_HOME -eq "C:\Users
 }
 # Ensure npm --prefix resolves even when shortcut's WorkingDirectory is repo root
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Desktop dev launches the daemon from packages/server/dist — the Electron app prefers the
+# compiled supervisor whenever it exists — so daemon-side edits need a rebuild before launch.
+# Set PASEO_SKIP_DEV_DAEMON_BUILD=1 for fast restarts that don't touch server or protocol code.
+if (-not $env:PASEO_SKIP_DEV_DAEMON_BUILD) {
+  $RepoRoot = (Resolve-Path "$ScriptDir\..\..\..").Path
+  Write-Host "  (building daemon workspace packages: npm run build:server)"
+  npm --prefix $RepoRoot run build:server
+  if ($LASTEXITCODE -ne 0) { throw "npm run build:server failed with exit code $LASTEXITCODE" }
+}
 Push-Location $ScriptDir\..
 try {
   & "$ScriptDir\dev.ps1" @args
