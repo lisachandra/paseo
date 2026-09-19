@@ -778,3 +778,66 @@ describe("selectProjectedTimelinePage", () => {
     expect(page.endSeq).toBe(501);
   });
 });
+
+describe("projectTimelineRows reasoning identity", () => {
+  test("merges reasoning chunks that share a message id across an interleaved tool call", () => {
+    const rows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-02-13T00:00:00.000Z",
+        item: { type: "reasoning", text: "First thought. ", messageId: "reason-1" },
+      },
+      {
+        seq: 2,
+        timestamp: "2026-02-13T00:00:00.100Z",
+        item: {
+          type: "tool_call",
+          callId: "call-1",
+          name: "read_file",
+          status: "completed",
+          detail: { type: "unknown" },
+          error: null,
+        },
+      },
+      {
+        seq: 3,
+        timestamp: "2026-02-13T00:00:00.200Z",
+        item: { type: "reasoning", text: "Second thought.", messageId: "reason-1" },
+      },
+    ];
+
+    const projected = projectTimelineRows({ rows, mode: "projected" });
+
+    expect(projected).toHaveLength(2);
+    expect(projected[0]?.item).toEqual({
+      type: "reasoning",
+      text: "First thought. Second thought.",
+      messageId: "reason-1",
+    });
+    expect(projected[0]?.seqStart).toBe(1);
+    expect(projected[0]?.seqEnd).toBe(3);
+    expect(projected[0]?.collapsed).toContain("reasoning_merge");
+    expect(projected[1]?.item).toMatchObject({ type: "tool_call", callId: "call-1" });
+  });
+
+  test("keeps reasoning chunks with different message ids separate", () => {
+    const rows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-02-13T00:00:00.000Z",
+        item: { type: "reasoning", text: "One", messageId: "reason-1" },
+      },
+      {
+        seq: 2,
+        timestamp: "2026-02-13T00:00:00.100Z",
+        item: { type: "reasoning", text: "Two", messageId: "reason-2" },
+      },
+    ];
+
+    const projected = projectTimelineRows({ rows, mode: "projected" });
+
+    expect(projected).toHaveLength(2);
+    expect(projected[0]?.item).toEqual({ type: "reasoning", text: "One", messageId: "reason-1" });
+    expect(projected[1]?.item).toEqual({ type: "reasoning", text: "Two", messageId: "reason-2" });
+  });
+});

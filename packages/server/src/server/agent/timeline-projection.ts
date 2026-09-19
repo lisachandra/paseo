@@ -149,6 +149,20 @@ function mergeIdentityEntries(existing: WorkingEntry, entry: WorkingEntry): Work
         seqEnd: Math.max(existing.seqEnd, entry.seqEnd),
         ...mergeIdentityMetadata(existing, entry, "tool_lifecycle"),
       };
+    case "reasoning":
+      if (existing.item.type !== "reasoning" || existing.turnId !== entry.turnId) return null;
+      return {
+        ...existing,
+        item: {
+          type: "reasoning",
+          text: `${existing.item.text}${entry.item.text}`,
+          ...(existing.item.messageId ? { messageId: existing.item.messageId } : {}),
+        },
+        timestamp: entry.timestamp,
+        seqEnd: Math.max(existing.seqEnd, entry.seqEnd),
+        ...mergeIdentityMetadata(existing, entry, "reasoning_merge"),
+      };
+
     case "plugin":
       if (existing.item.type !== "plugin") return null;
       return {
@@ -211,6 +225,14 @@ function mergeReasoningChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
     const previousReasoning = previous.item as Extract<AgentTimelineItem, { type: "reasoning" }>;
     const entryReasoning = entry.item as Extract<AgentTimelineItem, { type: "reasoning" }>;
 
+    if (
+      entryReasoning.messageId !== undefined &&
+      previousReasoning.messageId !== entryReasoning.messageId
+    ) {
+      output.push(entry);
+      continue;
+    }
+
     const collapsedKinds = new Set<TimelineProjectionKind>([
       ...previous.collapsed,
       ...entry.collapsed,
@@ -222,6 +244,7 @@ function mergeReasoningChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
       item: {
         type: "reasoning",
         text: `${previousReasoning.text}${entryReasoning.text}`,
+        ...(previousReasoning.messageId ? { messageId: previousReasoning.messageId } : {}),
       },
       timestamp: entry.timestamp,
       seqEnd: entry.seqEnd,

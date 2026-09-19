@@ -58,6 +58,7 @@ import {
   type WriteTextFileRequest,
   type Stream as ACPStream,
 } from "@agentclientprotocol/sdk";
+import type { Logger } from "pino";
 
 // Flat elicitation response matching the agent wire format (Dirac SDK 1.3.0).
 // paseo's pinned SDK 0.17.1 declares an outdated nested `ElicitationResponse`
@@ -67,7 +68,6 @@ type ElicitationResponse =
   | { action: "accept"; content?: Record<string, unknown> }
   | { action: "decline" }
   | { action: "cancel" };
-import type { Logger } from "pino";
 
 import {
   getAgentStreamEventTurnId,
@@ -3123,7 +3123,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     >,
   ):
     | { type: "assistant_message"; text: string; messageId: string }
-    | { type: "reasoning"; text: string }
+    | { type: "reasoning"; text: string; messageId?: string }
     | null {
     const chunkText = contentBlockToText(update.content);
     if (!chunkText) {
@@ -3136,7 +3136,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         messageId: this.resolveAssistantMessageId(update.messageId),
       };
     }
-    return { type: "reasoning", text: chunkText };
+    return {
+      type: "reasoning",
+      text: chunkText,
+      ...(update.messageId ? { messageId: update.messageId } : {}),
+    };
   }
 
   private resolveAssistantMessageId(messageId: string | null | undefined): string {
