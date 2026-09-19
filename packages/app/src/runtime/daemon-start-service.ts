@@ -1,5 +1,9 @@
 import { startDesktopDaemon, type DesktopDaemonStatus } from "@/desktop/daemon/desktop-daemon";
-import { connectionFromListen } from "@/types/host-connection";
+import {
+  connectionFromListen,
+  hostHasConnection,
+  type HostConnection,
+} from "@/types/host-connection";
 import type { HostRuntimeStore } from "@/runtime/host-runtime";
 
 export type DaemonStartResult = { ok: true } | { ok: false; error: string };
@@ -24,19 +28,20 @@ export async function upsertDesktopDaemonConnection(
   if (!serverId) {
     return { ok: false, error: "Desktop daemon did not return a server id." };
   }
-  if (store.getHosts().some((host) => host.serverId === serverId)) {
-    return { ok: true };
-  }
 
   const listenAddress = daemon.listen?.trim() ?? "";
   if (!listenAddress) {
     return { ok: false, error: "Desktop daemon did not return a listen address." };
   }
-  if (!connectionFromListen(listenAddress)) {
+  const connection = connectionFromListen(listenAddress);
+  if (!connection) {
     return {
       ok: false,
       error: `Desktop daemon returned an unsupported listen address: ${listenAddress}`,
     };
+  }
+  if (shouldKeepRegisteredHostConnection(store, serverId, connection)) {
+    return { ok: true };
   }
   await store.upsertConnectionFromListen({
     listenAddress,
@@ -44,6 +49,38 @@ export async function upsertDesktopDaemonConnection(
     hostname: daemon.hostname,
   });
   return { ok: true };
+}
+
+/**
+ * The managed daemon's listen address is the canonical way to reach it, but a
+ * registered host is left alone when the fresh address adds nothing: the exact
+ * connection is already present, or the host is reached through relay/SSH and
+ * a local address must not hijack that setup. A host reached only through
+ * direct connections gets the fresh address merged in so a moved daemon (for
+ * example a changed `daemon.listen`) does not leave the app dialing a stale
+ * endpoint forever.
+ */
+function shouldKeepRegisteredHostConnection(
+  store: DaemonConnectionStore,
+  serverId: string,
+  connection: HostConnection,
+): boolean {
+  const existing = store.getHosts().find((host) => host.serverId === serverId);
+  if (!existing) {
+    return false;
+  }
+  if (hostHasConnection(existing, connection)) {
+    return true;
+  }
+  return existing.connections.some((candidate) => !isDirectConnection(candidate));
+}
+
+function isDirectConnection(connection: HostConnection): boolean {
+  return (
+    connection.type === "directTcp" ||
+    connection.type === "directSocket" ||
+    connection.type === "directPipe"
+  );
 }
 
 export class DaemonStartService {

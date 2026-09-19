@@ -43,6 +43,26 @@ function makeStatus(overrides: Partial<DesktopDaemonStatus> = {}): DesktopDaemon
   };
 }
 
+function makeDirectOnlyHost(serverId: string, endpoint = "localhost:6767"): HostProfile {
+  return {
+    serverId,
+    label: "Desktop host",
+    appearance: defaultHostAppearance(),
+    lifecycle: {},
+    connections: [
+      {
+        id: `direct:${endpoint}`,
+        type: "directTcp",
+        endpoint,
+        useTls: false,
+      },
+    ],
+    preferredConnectionId: `direct:${endpoint}`,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
 function makeRelayOnlyHost(serverId: string): HostProfile {
   return {
     serverId,
@@ -318,6 +338,29 @@ describe("upsertDesktopDaemonConnection", () => {
 
   it("does not add localhost when desktop bootstrap finds its server id already registered", async () => {
     const fake = createFakeStore([makeRelayOnlyHost("srv_desktop")]);
+
+    const result = await upsertDesktopDaemonConnection(fake.store, makeStatus());
+
+    expect(result).toEqual({ ok: true });
+    expect(fake.upserts).toEqual([]);
+  });
+
+  it("refreshes a stale direct connection when the managed daemon moved listen addresses", async () => {
+    const fake = createFakeStore([makeDirectOnlyHost("srv_desktop", "localhost:6767")]);
+
+    const result = await upsertDesktopDaemonConnection(
+      fake.store,
+      makeStatus({ listen: "100.103.106.120:6767" }),
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(fake.upserts).toEqual([
+      { listenAddress: "100.103.106.120:6767", serverId: "srv_desktop", hostname: "desktop" },
+    ]);
+  });
+
+  it("skips the upsert when the registered host already has the reported connection", async () => {
+    const fake = createFakeStore([makeDirectOnlyHost("srv_desktop")]);
 
     const result = await upsertDesktopDaemonConnection(fake.store, makeStatus());
 
